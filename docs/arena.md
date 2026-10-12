@@ -207,7 +207,16 @@ The placeholder names the target
 and the verb (`Steer Agent A`, `Ask both a follow-up before choosing`) and the send button carries
 the verb. If the selected target stops being valid, keep the draft, clear the selection, and
 require another pick instead of rerouting it. Prompts and replies carry attachments (see
-**Attachments** under [A turn](#a-turn)). The toolbar stays on one row.
+**Attachments** under [A turn](#a-turn)). Steering waits for
+the current tool call or response to finish, so until the next model request includes a message,
+show it as queued at the end of that contestant's thread, never as sent: a one-line bubble, a line
+naming its images and files, and under the queue one muted line with what it waits for
+(`Sends when the current command finishes`) and **Send now**. A file's contents never show in the
+queue. Each queued message has its own delete, always visible because a hover-only one went
+unnoticed; it removes that message without interrupting the current work. **Send now** interrupts
+the running work and resumes the stored messages; unlike Stop, it must not submit them again or
+finish the contestant's battle run. Paseo's ordinary queue waits for an entire run, so the battle
+owns delivery. The toolbar stays on one row.
 When its own available width is narrow, shorten the target labels, show tool permissions as a
 status icon, and use the send arrow; retain the target-specific placeholder and accessible labels. Tool permissions use a quiet
 status menu: `Auto Accept` or `Ask before tools`. Its description names the scope and explains
@@ -963,8 +972,10 @@ with the control plane's `arenaAssignmentGenerationMetrics` record for the same 
 whose `createdAt` is when the hosted function reached the end of the response.
 
 `No recent activity` means the run has emitted no event for 90 seconds; it is not proof of a
-stalled process. Explicit retry and user-input waits take precedence. That UI label alone must not
-stop or restart a contestant.
+stalled process. Explicit retry and user-input waits take precedence. A tool call that is still
+running reads `Running a command` or `Running a tool` instead: a long command emits nothing until it
+ends, the same reason the engine's deadline pauses for it. That UI label alone must not stop or
+restart a contestant.
 
 ## Gotchas
 
