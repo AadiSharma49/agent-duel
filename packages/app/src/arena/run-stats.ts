@@ -1,7 +1,11 @@
 import type { ArenaRun } from "@getpaseo/protocol/arena/rpc-schemas";
 import { arenaLongRunningTool, isArenaRunPossiblyStalled } from "./run-liveness";
 
-const OFFLINE_MESSAGE = "Waiting for network";
+const RETRY_MESSAGES = new Set([
+  "Waiting for network",
+  "Continuing after response limit",
+  "Continuing after model timeout",
+]);
 
 type ArenaRunTiming = Pick<ArenaRun, "runState" | "startedAt" | "completedAt" | "durationMs">;
 
@@ -38,9 +42,11 @@ export function arenaRunStatusLabel(run: ArenaRun, now: number): string {
         "type" in run.status &&
         run.status.type === "retry"
       )
-        // The engine's offline wait (`ARENA_OFFLINE_MESSAGE` in arena-backend `session/retry.ts`).
-        return "message" in run.status && run.status.message === OFFLINE_MESSAGE
-          ? OFFLINE_MESSAGE
+        // The engine's neutral recovery and offline-wait messages preserve blinding.
+        return "message" in run.status &&
+          typeof run.status.message === "string" &&
+          RETRY_MESSAGES.has(run.status.message)
+          ? run.status.message
           : "Retrying";
       switch (arenaLongRunningTool(run, now)) {
         case "command":
