@@ -377,6 +377,77 @@ describe("OpenRouter proxy", () => {
     expect(await (await invoke()).text()).toContain("arena_payment_required")
   })
 
+  test("asks OpenRouter to cache Anthropic prompts and records the cache use", async () => {
+    const slug = "anthropic/hidden-model"
+    const upstreamBodies: Record<string, unknown>[] = []
+    let recordedMetrics: Record<string, unknown> | undefined
+    const db = fakeDb({
+      assignmentSets: () => [
+        {
+          userId: "user-1",
+          scopeID: "turn-1",
+          assignments: [
+            {
+              assignmentID: "opaque-id",
+              model: { displayName: "Hidden Model", slug, canonicalSlug: slug, routing: { sort: "throughput" } },
+            },
+          ],
+        },
+      ],
+      recordMetrics: (document) => {
+        recordedMetrics = document
+      },
+    })
+    const proxy = openrouter({
+      db: async () => db,
+      fetch: async (_input, init) => {
+        upstreamBodies.push(JSON.parse(new TextDecoder().decode(init?.body as ArrayBuffer)) as Record<string, unknown>)
+        return Response.json({
+          choices: [{ message: { content: "done" } }],
+          usage: {
+            prompt_tokens: 1000,
+            completion_tokens: 5,
+            prompt_tokens_details: { cached_tokens: 900, cache_write_tokens: 80 },
+          },
+        })
+      },
+    })
+    const tools = [{ type: "function", function: { name: "read", parameters: { type: "object" } } }]
+    const invoke = (route: string, fields: Record<string, unknown> = {}) =>
+      proxy(
+        new Request(`https://control.test/api/openrouter/api/v1/${route}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Arena-Assignment-ID": "opaque-id",
+            "X-Arena-Scope-ID": "turn-1",
+            "X-Arena-Generation-ID": "gen_00000000000000000000000000000001",
+          },
+          body: JSON.stringify({ model: "contestant", messages: [], tools, stream: false, ...fields }),
+        }),
+      )
+
+    expect((await invoke("chat/completions")).status).toBe(200)
+    expect(recordedMetrics).toMatchObject({ usage: { promptTokens: 1000, cacheReadTokens: 900, cacheWriteTokens: 80 } })
+    expect((await invoke("responses")).status).toBe(200)
+    expect(upstreamBodies.map((body) => body.cache_control)).toEqual([{ type: "ephemeral" }, { type: "ephemeral" }])
+
+    // A body that marks its own breakpoints is forwarded as sent.
+    const marker = { type: "ephemeral", ttl: "1h" }
+    const messages = [{ role: "user", content: [{ type: "text", text: "hi", cache_control: marker }] }]
+    await invoke("chat/completions", { messages })
+    expect(upstreamBodies.at(-1)).not.toHaveProperty("cache_control")
+    expect(upstreamBodies.at(-1)?.messages).toEqual(messages)
+    await invoke("chat/completions", { cache_control: marker })
+    expect(upstreamBodies.at(-1)?.cache_control).toEqual(marker)
+
+    // Compaction summaries and titles carry no tools, and no later request reads their prefix.
+    for (const fields of [{ tools: undefined }, { tools: [] }]) {
+      await invoke("chat/completions", fields)
+      expect(upstreamBodies.at(-1)).not.toHaveProperty("cache_control")
+    }
+  })
+
   test("does not limit assigned request size", async () => {
     const content = "x".repeat(2 * 1024 * 1024 + 1)
     let upstreamContentLength = 0
