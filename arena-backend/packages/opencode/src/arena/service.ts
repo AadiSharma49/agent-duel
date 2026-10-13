@@ -3947,6 +3947,32 @@ export const layer: Layer.Layer<
       )
     })
 
+    // The proxy routes a contestant's requests, and the recorder keeps its events, only for a run
+    // bound in this process. A battle binds each run as it starts it. After an engine restart a
+    // settled run is bound to nothing, so resuming it for a reply or a retry binds it again.
+    const bindRun = Effect.fnUntraced(function* (run: RunDocument) {
+      const assignment = {
+        runID: run._id,
+        rootSessionID: run.rootSessionID,
+        scopeID: run.turnID,
+        assignmentID: run.proxyAssignmentID,
+        telemetry: true,
+      }
+      registry.assign(run.rootSessionID, assignment)
+      const currentRecorder = recorder
+      if (currentRecorder) {
+        yield* promise(() =>
+          currentRecorder.register({
+            turnID: run.turnID,
+            runID: run._id,
+            rootSessionID: run.rootSessionID,
+            directory: run.worktree,
+            assignment,
+          }),
+        )
+      }
+    })
+
     const runPrompt = Effect.fn("Arena.runPrompt")(function* (
       store: Store,
       run: SideRuntime,
@@ -4804,26 +4830,7 @@ export const layer: Layer.Layer<
             createdAt: now,
           }),
         )
-        const proxyAssignment = {
-          runID,
-          rootSessionID: forkedID,
-          scopeID: turn._id,
-          assignmentID: selected.assignmentID,
-          telemetry: true,
-        }
-        registry.assign(forkedID, proxyAssignment)
-        const currentRecorder = recorder
-        if (currentRecorder) {
-          yield* promise(() =>
-            currentRecorder.register({
-              turnID: turn._id,
-              runID,
-              rootSessionID: forkedID,
-              directory: info.directory,
-              assignment: proxyAssignment,
-            }),
-          )
-        }
+        yield* bindRun(run)
         const runtime = {
           side,
           turnID: turn._id,
@@ -5781,7 +5788,7 @@ export const layer: Layer.Layer<
         if (turn.state === "awaiting_vote") {
           yield* promise(() => store.clearComparison(turn._id, input.comparisonID))
         }
-        return yield* Effect.forEach(runs, input.reset)
+        return yield* Effect.forEach(runs, (run) => input.reset(run).pipe(Effect.tap(bindRun)))
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
