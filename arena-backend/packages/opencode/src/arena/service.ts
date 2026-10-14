@@ -4347,6 +4347,7 @@ export const layer: Layer.Layer<
         generateComparison({
           store,
           turnID: turn._id,
+          turnIndex: turn.turnIndex,
           userPrompt: turn.userPrompt,
           userAttachments: ArenaAttachments.describeForJudge(turn.userAttachments),
           baseCommit: turn.frozenBaseSHA,
