@@ -1,7 +1,8 @@
 import { hashArenaControlToken, setArenaCredentials } from "@/arena/credentials"
 import { $ } from "bun"
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { createHash } from "crypto"
+import { createHash, randomBytes } from "crypto"
+import { imageArtifactID } from "@agent-duel/arena-service/research-protocol"
 import { createServer } from "net"
 import { Global } from "@opencode-ai/core/global"
 import { rename, rm, stat, writeFile } from "fs/promises"
@@ -315,8 +316,9 @@ function chunks(lines: ReadonlyArray<unknown>) {
 function contestantResponse(
   model: string,
   ordinal: number,
-  tool?: "bash" | "question",
+  tool?: "bash" | "question" | "read",
   normalFixture: false | "file" | "transcript" = false,
+  /** The command to run, or for a read the file to read. */
   commandOverride?: string,
   generationKey: string = String(ordinal),
 ) {
@@ -358,7 +360,9 @@ function contestantResponse(
             },
           ],
         }
-      : { command }
+      : tool === "read"
+        ? { filePath: commandOverride }
+        : { command }
   return chunks([
     { ...base, choices: [{ index: 0, delta: { role: "assistant" } }] },
     {
@@ -407,6 +411,8 @@ function installOpenRouterStub(options?: {
   readonly questionOrdinals?: ReadonlyArray<number>
   readonly emptyOrdinals?: ReadonlyArray<number>
   readonly contestantCommands?: Readonly<Partial<Record<number, string>>>
+  /** Files a contestant reads with the read tool, one per request, before it answers. */
+  readonly contestantReads?: Readonly<Partial<Record<number, readonly string[]>>>
   /** Contestants whose first request fails with a retryable 503 the engine will not wait out. */
   readonly failFirstOrdinals?: ReadonlyArray<number>
   /** Scripts a contestant reply outright, subagent requests included; undefined falls back to the rules above. */
@@ -536,19 +542,23 @@ function installOpenRouterStub(options?: {
     const normalCommandKey = `${body.model}\n${requestText}`
     const runNormalCommand = (normalFixture || transcriptOnlyFixture) && !completedNormalCommands.has(normalCommandKey)
     if (runNormalCommand) completedNormalCommands.add(normalCommandKey)
+    const reads = runNormalCommand ? undefined : options?.contestantReads?.[number]
+    const read = reads?.[count - 1]
     const tool = runNormalCommand
       ? "bash"
-      : count !== 1 || options?.emptyOrdinals?.includes(number)
-        ? undefined
-        : options?.questionOrdinals?.includes(number)
-          ? "question"
-          : "bash"
+      : read
+        ? "read"
+        : reads || count !== 1 || options?.emptyOrdinals?.includes(number)
+          ? undefined
+          : options?.questionOrdinals?.includes(number)
+            ? "question"
+            : "bash"
     return contestantResponse(
       "contestant",
       number,
       tool,
       runNormalCommand ? (transcriptOnlyFixture ? "transcript" : "file") : false,
-      options?.contestantCommands?.[number],
+      read ?? options?.contestantCommands?.[number],
       // OpenRouter generates one opaque ID per request even when a tool loop
       // sends multiple requests to the same model.
       `${number}-${count}`,
@@ -998,6 +1008,120 @@ describe("Arena service vertical slice", () => {
       router.restore()
     }
   }, 30_000)
+
+  test("a run that reads large screenshots reaches the vote, and no snapshot carries them", async () => {
+    await using directory = await tmpdir({
+      git: true,
+      config: { formatter: false, lsp: false, watcher: { ignore: [".git"] } },
+    })
+    const photon = await import("@silvia-odwyer/photon-node")
+    // Noise does not compress, like a real screenshot.
+    const png = (side: number) => {
+      const image = new photon.PhotonImage(new Uint8Array(randomBytes(side * side * 4)), side, side)
+      const bytes = Buffer.from(image.get_bytes())
+      image.free()
+      return bytes
+    }
+    // Each is just within the read tool's image limits, so it is kept as read. Held inline, the four
+    // put each side's transcript over the artifact limit, so neither was kept and the turn had nothing
+    // to compare: it stopped instead of asking for a vote.
+    const screenshots = Array.from({ length: 4 }, () => png(900))
+    const files = screenshots.map((_, index) => `screenshot-${index + 1}.png`)
+    for (const [index, file] of files.entries()) await writeFile(`${directory.path}/${file}`, screenshots[index]!)
+    await $`git add opencode.json ${files}`.cwd(directory.path).quiet()
+    await $`git commit -m "test: add screenshots"`.cwd(directory.path).quiet()
+    const memory = memoryStore()
+    const router = installOpenRouterStub({ contestantReads: { 1: files, 2: files } })
+    process.env.OPENCODE_ARENA = "1"
+    setStoreForTest(memory.store)
+
+    // The window gets none of the screenshots' bytes: sent along, each snapshot below was over 34 MB,
+    // and the daemon closes a socket that has more than 64 MiB waiting. The pasted image stays, since
+    // the battle card shows it.
+    const screenshotData = screenshots.map((bytes) => bytes.subarray(0, 3000).toString("base64"))
+    const expectLight = (snapshot: PublicSnapshot) => {
+      const text = JSON.stringify(snapshot)
+      expect(text.length).toBeLessThan(1024 * 1024)
+      expect(screenshotData.filter((data) => text.includes(data))).toEqual([])
+      for (const run of snapshot.runs) {
+        const prompt = (run.messages ?? []).find((message) => message.role === "user")
+        expect(JSON.stringify(run.parts?.[String(prompt?.id)])).toContain("data:image/")
+      }
+    }
+
+    try {
+      const headers = { "content-type": "application/json", "x-opencode-directory": directory.path }
+      const source = await json<{ id: string }>(
+        await request("/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "Screenshots" }),
+        }),
+      )
+      const attached = await json<PublicSnapshot>(await request(`/arena/sessions/${source.id}`, { headers }))
+      const admitted = await json<PublicSnapshot>(
+        await request(`/arena/chats/${attached.chat.id}/turns`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            prompt: "Make the page match this.",
+            attachments: [{ type: "image", mimeType: "image/png", data: png(64).toString("base64") }],
+          }),
+        }),
+      )
+      const turnID = admitted.turn?.id
+      if (!turnID) throw new Error("Arena did not admit the screenshot battle")
+      const deadline = Date.now() + 30_000
+      let settled = await memory.store.turn(turnID)
+      while (
+        settled?.state !== "awaiting_vote" &&
+        settled?.state !== "awaiting_stop_resolution" &&
+        Date.now() < deadline
+      ) {
+        await Bun.sleep(20)
+        settled = await memory.store.turn(turnID)
+      }
+      expect(settled?.state).toBe("awaiting_vote")
+
+      const imageIDs = screenshots.map((bytes) => createHash("sha256").update(bytes).digest("hex"))
+      for (const run of await memory.store.runsForTurn(turnID)) {
+        const transcript = await memory.store.artifact(`${run._id}|transcript`)
+        expect(transcript?.truncated).toBe(false)
+        expect(transcript?.imageIDs).toEqual(expect.arrayContaining(imageIDs))
+        expect(transcript!.storedSize).toBeLessThan(1024 * 1024)
+        for (const [index, id] of imageIDs.entries()) {
+          expect(await memory.store.artifact(imageArtifactID(run._id, id))).toMatchObject({
+            kind: "image",
+            storedSize: screenshots[index]!.byteLength,
+            truncated: false,
+          })
+        }
+      }
+
+      const followedUp = await json<PublicSnapshot>(
+        await request(`/arena/turns/${turnID}/reply`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: "Check them once more.", target: "both" }),
+        }),
+      )
+      expectLight(followedUp)
+      await waitForTurn(memory.store, turnID, "awaiting_vote")
+
+      const voted = await json<PublicSnapshot>(
+        await request(`/arena/turns/${turnID}/vote`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ vote: "a" }),
+        }),
+      )
+      expectLight(voted)
+      await waitForTurn(memory.store, turnID, "complete")
+      expectLight(await json<PublicSnapshot>(await request(`/arena/turns/${turnID}`, { headers })))
+    } finally {
+      router.restore()
+    }
+  }, 90_000)
 
   test("honors an already committed valid decision instead of applying a later choice", async () => {
     await using directory = await tmpdir({

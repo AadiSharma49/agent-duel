@@ -1531,11 +1531,17 @@ export const layer: Layer.Layer<
                   if (!root || !Array.isArray(root.messages)) {
                     throw new Error(`Arena root transcript archive is missing: ${run._id}`)
                   }
-                  const transcript = ArenaTranscript.project(
-                    payload.flatMap((item) =>
-                      typeof item === "object" && item !== null && "messages" in item && Array.isArray(item.messages)
-                        ? item.messages
-                        : [],
+                  // The projection leaves out tool results' images; the battle card shows the prompt's,
+                  // so those come back from the archive.
+                  const transcript = await ArenaTranscriptArtifact.withImages(
+                    store,
+                    run._id,
+                    ArenaTranscript.project(
+                      payload.flatMap((item) =>
+                        typeof item === "object" && item !== null && "messages" in item && Array.isArray(item.messages)
+                          ? item.messages
+                          : [],
+                      ),
                     ),
                   )
                   const permissions = Array.isArray(root.permissionState)
@@ -3318,21 +3324,11 @@ export const layer: Layer.Layer<
             : {}),
         })
       }
-      const encoded = ArenaTranscriptArtifact.encode(archived)
-      const artifactID = `${run.runID}|transcript`
-      const artifact = yield* promise(() =>
-        store.storeArtifact({
-          _id: artifactID,
-          runID: run.runID,
-          turnID: turn._id,
-          kind: "transcript",
-          mimeType: "application/json",
-          encoding: "json",
-          compression: encoded.compression,
-          data: encoded.data,
-          createdAt: new Date(),
-        }),
+      const written = yield* promise(() =>
+        ArenaTranscriptArtifact.write(store, { runID: run.runID, turnID: turn._id, archived }),
       )
+      const artifact = written.transcript
+      const artifactID = artifact._id
       const document: SessionArchiveDocument = {
         _id: `${run.runID}|archive`,
         runID: run.runID,
@@ -3345,10 +3341,11 @@ export const layer: Layer.Layer<
           messageCount: item.messages.length,
           ...(item.messageBoundary ? { messageBoundary: item.messageBoundary } : {}),
         })),
-        artifactIDs: [artifactID],
+        // The transcript comes first: readers take the first ID as the transcript.
+        artifactIDs: written.artifactIDs,
         contentHash: digest(archived),
         serializationVersion: "v1",
-        originalSize: encoded.originalSize,
+        originalSize: written.originalSize,
         storedSize: artifact.storedSize,
         truncated: artifact.truncated,
         createdAt: new Date(),
