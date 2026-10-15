@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { expect, spyOn } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import fs from "fs/promises"
 import os from "os"
@@ -52,7 +52,9 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { InstanceStore } from "@/project/instance-store"
+import { gateToolExecution } from "@/session/tool-execution-gate"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -311,6 +313,352 @@ const outputLimitSession = Effect.fn("test.outputLimitSession")(function* () {
 })
 
 const idleIt = testEffect(makeHttp({ idle: true }))
+
+it.instance("Arena dispatch and cancellation do not wait for an unprepared worktree", () =>
+  Effect.gen(function* () {
+    const { chat, llm } = yield* outputLimitSession()
+    const prompt = yield* SessionPrompt.Service
+    const directory = yield* tmpdirScoped()
+    const gate = gateToolExecution(chat.id, {
+      worktree: directory,
+      copiedPaths: [],
+      provide: (effect) => Effect.never.pipe(Effect.andThen(effect)),
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(() => gate.dispose()))
+    yield* llm.push(reply().hang())
+    const run = yield* prompt
+      .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Start before checkout preparation." }] })
+      .pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      llm.inputs.pipe(Effect.map((inputs) => (inputs.length ? true : undefined))),
+      "first request waited for checkout preparation",
+    )
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.join(run)
+    expect(yield* llm.misses).toHaveLength(0)
+  }),
+)
+
+const taskEnvironment = Effect.fn("test.taskEnvironment")(function* (sessionID: SessionID, hosted: boolean) {
+  const store = yield* InstanceStore.Service
+  const directory = hosted ? yield* tmpdirScoped() : (yield* TestInstance).directory
+  const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => store.provide({ directory }, effect)
+  if (hosted) {
+    const gate = gateToolExecution(sessionID, { worktree: directory, copiedPaths: [], provide })
+    gate.release()
+    yield* Effect.addFinalizer(() => Effect.sync(() => gate.dispose()))
+  }
+  return provide
+})
+
+for (const hosted of [false, true]) {
+  for (const outcome of ["completed", "error"] as const) {
+    it.instance(`Arena preserves the ${outcome} child notification interrupted during save (hosted=${hosted})`, () =>
+      Effect.gen(function* () {
+        const { chat, llm, session } = yield* outputLimitSession()
+        const inTasks = yield* taskEnvironment(chat.id, hosted)
+        const prompt = yield* SessionPrompt.Service
+        const jobs = yield* BackgroundJob.Service
+        const finishChild = yield* Deferred.make<void>()
+        const saving = yield* Deferred.make<void>()
+        const save = yield* Deferred.make<void>()
+        const child = (body: Record<string, unknown>) =>
+          Array.isArray(body.messages) &&
+          body.messages.some((message) => message.role === "user" && message.content === "child-save-only")
+        const response = reply().wait(deferredAsPromise(finishChild))
+        yield* llm.pushMatch(
+          ({ body }) => child(body),
+          outcome === "completed" ? response.text("CHILD_RESULT").stop() : response.contentFilter(),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => !child(body),
+          reply().tool("task", { description: "child", prompt: "child-save-only", subagent_type: "general" }),
+          reply().hang(),
+          reply().text("Steer answered.").stop(),
+        )
+        const run = yield* prompt
+          .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Delegate and continue." }] })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length >= 3 ? true : undefined))),
+          "parent and child did not start",
+        )
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "QUEUED_STEER" }],
+        })
+        const get = session.get
+        let pause = true
+        // Hold notification delivery before its first parent lookup can persist anything.
+        const lookup = spyOn(session, "get").mockImplementation((id) =>
+          pause && id === chat.id
+            ? Deferred.succeed(saving, undefined).pipe(Effect.andThen(Deferred.await(save)), Effect.andThen(get(id)))
+            : get(id),
+        )
+        yield* Effect.gen(function* () {
+          yield* Deferred.succeed(finishChild, undefined)
+          yield* awaitWithTimeout(Deferred.await(saving), "notification did not start saving")
+          pause = false
+          const cancel = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+          // Send now has cancelled the job while its result is still being saved.
+          yield* pollWithTimeout(
+            inTasks(jobs.list()).pipe(
+              Effect.map((items) => (items.length === 1 && items[0]?.status === "cancelled" ? true : undefined)),
+            ),
+            "child job was not cancelled",
+          )
+          yield* Deferred.succeed(save, undefined)
+          yield* Fiber.join(cancel)
+          yield* Fiber.join(run)
+          const resumed = yield* prompt.loop({ sessionID: chat.id })
+          expect(resumed.parts.some((part) => part.type === "text" && part.text === "Steer answered.")).toBe(true)
+          const notices = (yield* session.messages({ sessionID: chat.id }))
+            .flatMap((message) => message.parts)
+            .filter((part) => part.type === "text" && part.synthetic && part.text.includes("<task id="))
+          expect(notices).toHaveLength(1)
+          expect(notices[0]).toMatchObject({ text: expect.stringContaining(`state="${outcome}"`) })
+          const input = JSON.stringify((yield* llm.inputs).at(-1))
+          expect(input).toContain("QUEUED_STEER")
+          expect(input).toContain(
+            outcome === "completed" ? "CHILD_RESULT" : "The subagent could not complete its task.",
+          )
+          expect(input).not.toContain("Subagent cancelled")
+          expect(yield* llm.misses).toHaveLength(0)
+        }).pipe(
+          Effect.ensuring(Deferred.succeed(save, undefined)),
+          Effect.ensuring(Effect.sync(() => lookup.mockRestore())),
+        )
+      }),
+    )
+  }
+
+  it.instance(
+    `Arena keeps parallel children alive, answers a steer, and integrates both results (hosted=${hosted})`,
+    () =>
+      Effect.gen(function* () {
+        const { chat, llm, session } = yield* outputLimitSession()
+        const inTasks = yield* taskEnvironment(chat.id, hosted)
+        const prompt = yield* SessionPrompt.Service
+        const jobs = yield* BackgroundJob.Service
+        const first = yield* Deferred.make<void>()
+        const second = yield* Deferred.make<void>()
+        const child = (body: Record<string, unknown>, text: string) =>
+          Array.isArray(body.messages) &&
+          body.messages.some((message) => message.role === "user" && message.content === text)
+        yield* llm.pushMatch(
+          ({ body }) => child(body, "first-child-only"),
+          reply().wait(deferredAsPromise(first)).text("first child result").stop(),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => child(body, "second-child-only"),
+          reply().wait(deferredAsPromise(second)).text("second child result").stop(),
+        )
+        yield* llm.pushMatch(
+          ({ body }) => !child(body, "first-child-only") && !child(body, "second-child-only"),
+          raw({
+            chunks: [
+              {
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "first-task",
+                          type: "function",
+                          function: {
+                            name: "task",
+                            arguments: JSON.stringify({
+                              description: "first child",
+                              prompt: "first-child-only",
+                              subagent_type: "general",
+                            }),
+                          },
+                        },
+                        {
+                          index: 1,
+                          id: "second-task",
+                          type: "function",
+                          function: {
+                            name: "task",
+                            arguments: JSON.stringify({
+                              description: "second child",
+                              prompt: "second-child-only",
+                              subagent_type: "general",
+                            }),
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              },
+              { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+            ],
+          }),
+          reply().text("Waiting for children.").stop(),
+          reply().text("Steer received while children work.").stop(),
+          reply().text("First result integrated.").stop(),
+          reply().text("Both results integrated.").stop(),
+        )
+        const run = yield* prompt
+          .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Delegate two independent tasks." }] })
+          .pipe(Effect.forkChild)
+        const waitForText = (text: string) =>
+          pollWithTimeout(
+            session
+              .messages({ sessionID: chat.id })
+              .pipe(
+                Effect.map((messages) =>
+                  messages.some((message) => message.parts.some((part) => part.type === "text" && part.text === text))
+                    ? true
+                    : undefined,
+                ),
+              ),
+            `timed out waiting for ${text}`,
+          )
+        yield* waitForText("Waiting for children.")
+        expect((yield* inTasks(jobs.list())).filter((job) => job.status === "running")).toHaveLength(2)
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "Keep the changes small." }],
+        })
+        yield* waitForText("Steer received while children work.")
+        expect((yield* inTasks(jobs.list())).filter((job) => job.status === "running")).toHaveLength(2)
+        yield* Deferred.succeed(first, undefined)
+        yield* waitForText("First result integrated.")
+        expect((yield* inTasks(jobs.list())).filter((job) => job.status === "running")).toHaveLength(1)
+        yield* Deferred.succeed(second, undefined)
+        const result = yield* Fiber.join(run)
+        expect(result.parts.some((part) => part.type === "text" && part.text === "Both results integrated.")).toBe(true)
+        expect((yield* inTasks(jobs.list())).filter((job) => job.status === "running")).toHaveLength(0)
+        const inputs = yield* llm.inputs
+        expect(JSON.stringify(inputs.at(-1))).toContain("first child result")
+        expect(JSON.stringify(inputs.at(-1))).toContain("second child result")
+        expect(yield* llm.misses).toHaveLength(0)
+      }),
+  )
+
+  it.instance(`Arena Stop cancels a background child while the parent waits (hosted=${hosted})`, () =>
+    Effect.gen(function* () {
+      const { chat, llm, session } = yield* outputLimitSession()
+      const inTasks = yield* taskEnvironment(chat.id, hosted)
+      const prompt = yield* SessionPrompt.Service
+      const jobs = yield* BackgroundJob.Service
+      const child = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) &&
+        body.messages.some((message) => message.role === "user" && message.content === "child-wait-only")
+      yield* llm.pushMatch(({ body }) => child(body), reply().hang())
+      yield* llm.pushMatch(
+        ({ body }) => !child(body),
+        reply().tool("task", { description: "waiting child", prompt: "child-wait-only", subagent_type: "general" }),
+        reply().text("Waiting for my child.").stop(),
+      )
+      const run = yield* prompt
+        .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Delegate a task." }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        session
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) =>
+                message.parts.some((part) => part.type === "text" && part.text === "Waiting for my child."),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "timed out waiting for parent",
+      )
+      expect((yield* inTasks(jobs.list())).map((job) => job.status)).toEqual(["running"])
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.join(run)
+      expect((yield* inTasks(jobs.list())).map((job) => job.status)).toEqual(["cancelled"])
+      const messages = yield* session.messages({ sessionID: chat.id })
+      const users = messages.filter((message) => message.info.role === "user")
+      expect(users).toHaveLength(2)
+      expect(users[1]?.parts).toMatchObject([{ type: "text", synthetic: true }])
+      expect(JSON.stringify(users[1]?.parts)).toContain('state=\\"cancelled\\"')
+    }),
+  )
+
+  it.instance(`Arena tells the parent when Send now cancels a background child (hosted=${hosted})`, () =>
+    Effect.gen(function* () {
+      const { chat, llm, session } = yield* outputLimitSession()
+      const inTasks = yield* taskEnvironment(chat.id, hosted)
+      const prompt = yield* SessionPrompt.Service
+      const jobs = yield* BackgroundJob.Service
+      const child = (body: Record<string, unknown>) =>
+        Array.isArray(body.messages) &&
+        body.messages.some((message) => message.role === "user" && message.content === "child-send-now-only")
+      yield* llm.pushMatch(({ body }) => child(body), reply().hang())
+      yield* llm.pushMatch(
+        ({ body }) => !child(body),
+        reply().tool("task", { description: "slow child", prompt: "child-send-now-only", subagent_type: "general" }),
+        reply().hang(),
+        reply().text("Answered the steer.").stop(),
+      )
+      const run = yield* prompt
+        .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Delegate a task and keep working." }] })
+        .pipe(Effect.forkChild)
+      // The parent's own next request runs alongside the child.
+      yield* pollWithTimeout(
+        llm.inputs.pipe(Effect.map((inputs) => (inputs.length >= 3 ? true : undefined))),
+        "timed out waiting for the parent to continue alongside its child",
+      )
+      const [job] = yield* inTasks(jobs.list())
+      expect(job?.status).toBe("running")
+      // Send now queues the steer, cancels the contestant and its descendants, then resumes the loop.
+      yield* prompt.prompt({ sessionID: chat.id, noReply: true, parts: [{ type: "text", text: "Also rename foo." }] })
+      yield* prompt.cancel(chat.id)
+      yield* inTasks(prompt.cancel(SessionID.make(job!.id)))
+      yield* Fiber.join(run)
+      const resumed = yield* prompt.loop({ sessionID: chat.id })
+      expect(resumed.parts.some((part) => part.type === "text" && part.text === "Answered the steer.")).toBe(true)
+      expect((yield* inTasks(jobs.list())).map((item) => item.status)).toEqual(["cancelled"])
+      const notices = (yield* session.messages({ sessionID: chat.id }))
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text" && part.synthetic && part.text.includes('state="cancelled"'))
+      expect(notices).toHaveLength(1)
+      const last = JSON.stringify((yield* llm.inputs).at(-1))
+      expect(last).toContain("Also rename foo.")
+      expect(last).toContain("Subagent cancelled")
+      expect(yield* llm.misses).toHaveLength(0)
+    }),
+  )
+}
+
+it.instance("Arena delivers a failed child as an error and lets the parent recover", () =>
+  Effect.gen(function* () {
+    const { chat, llm, session } = yield* outputLimitSession()
+    const prompt = yield* SessionPrompt.Service
+    const jobs = yield* BackgroundJob.Service
+    const child = (body: Record<string, unknown>) =>
+      Array.isArray(body.messages) &&
+      body.messages.some((message) => message.role === "user" && message.content === "child-error-only")
+    yield* llm.pushMatch(({ body }) => child(body), reply().contentFilter())
+    yield* llm.pushMatch(
+      ({ body }) => !child(body),
+      reply().tool("task", { description: "failing child", prompt: "child-error-only", subagent_type: "general" }),
+      reply().text("Checking the result.").stop(),
+      reply().text("Recovered from child failure.").stop(),
+    )
+    const result = yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Delegate a task." }] })
+    expect(result.info.role).toBe("assistant")
+    expect((yield* jobs.list()).map((job) => job.status)).toEqual(["error"])
+    const messages = yield* session.messages({ sessionID: chat.id })
+    const errors = messages
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "text" && part.synthetic && part.text.includes("<task_error>"))
+    expect(errors).toHaveLength(1)
+    expect(JSON.stringify((yield* llm.inputs).at(-1))).toContain("<task_error>")
+  }),
+)
 
 idleIt.instance("Arena recovers model idle with smaller requests and preserves partial text", () =>
   Effect.gen(function* () {
