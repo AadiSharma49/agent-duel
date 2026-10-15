@@ -159,7 +159,8 @@ import {
 } from "@/arena/reply-state";
 import { useArenaReplyComposerControls } from "@/arena/reply-target-control";
 import {
-  arenaSummaryAnchor,
+  arenaSummaryAnchors,
+  arenaTurnFollowedUp,
   isArenaBattleOnScreen,
   partitionArenaSummaries,
 } from "@/arena/summary-anchor";
@@ -1572,14 +1573,8 @@ const AgentStreamSection = memo(function AgentStreamSection({
   const arenaSession = useArenaSessionQuery(serverId, agentId ?? "");
   const startingBattle = useStartingArenaBattle(serverId, agentId ?? "");
   // The collapsed summary arrives in the same frame the panes leave in.
-  // A battle that has been sent counts as on screen from the moment it is sent, so the
-  // previous battle's summary moves inline once instead of vanishing and coming back when the
-  // turn finally lands.
+  // A battle that has been sent counts as on screen from the moment it is sent.
   const arenaBattleOnScreen = isArenaBattleOnScreen(arenaSession.data) || startingBattle !== null;
-  const summaryPlacement = useMemo(
-    () => partitionArenaSummaries(arenaSession.data?.history ?? [], arenaBattleOnScreen),
-    [arenaBattleOnScreen, arenaSession.data?.history],
-  );
   const pendingPermissionList = useStoreWithEqualityFn(
     useSessionStore,
     (state) => {
@@ -1607,10 +1602,45 @@ const AgentStreamSection = memo(function AgentStreamSection({
     return new Map(pendingPermissionList.map((permission) => [permission.key, permission]));
   }, [pendingPermissionList]);
 
+  const streamHead = useSessionStore((state) =>
+    agentId ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,
+  );
+  const presentedStream = usePendingArenaPrompt({
+    serverId,
+    agentId: agentId ?? "",
+    snapshot: arenaSession.data,
+    streamItems,
+    streamHead: streamHead ?? EMPTY_STREAM_ITEMS,
+    hasAppliedAuthoritativeHistory,
+  });
+  // The newest summary sits at the end of the chat, above the next battle while that one runs,
+  // until a later prompt follows its turn; then it stays under its own turn. Placed inline any
+  // earlier, it lands above that turn's footer, which the stream draws after its last row.
+  const latestSummary = useMemo(
+    () => partitionArenaSummaries(arenaSession.data?.history ?? [], false).live,
+    [arenaSession.data?.history],
+  );
+  const latestSummaryFollowedUp = useMemo(
+    () => latestSummary !== null && arenaTurnFollowedUp(latestSummary, presentedStream),
+    [latestSummary, presentedStream],
+  );
+  // The feedback prompt stays at the end of the chat even after the summary moves up.
+  const feedbackBattle = arenaBattleOnScreen ? null : latestSummary;
+  const summaryPlacement = useMemo(
+    () => partitionArenaSummaries(arenaSession.data?.history ?? [], latestSummaryFollowedUp),
+    [arenaSession.data?.history, latestSummaryFollowedUp],
+  );
+  // Keyed by the anchors themselves, so a streaming head does not rebuild every row.
+  const summaryAnchorKey = useMemo(
+    () => JSON.stringify(arenaSummaryAnchors(summaryPlacement.inline, presentedStream)),
+    [presentedStream, summaryPlacement.inline],
+  );
+
   const arenaAfterItems = useMemo(() => {
+    const anchors: (string | null)[] = JSON.parse(summaryAnchorKey);
     const groups = new Map<string, React.ReactNode[]>();
-    for (const historyItem of summaryPlacement.inline) {
-      const anchor = arenaSummaryAnchor(historyItem, streamItems);
+    for (const [index, historyItem] of summaryPlacement.inline.entries()) {
+      const anchor = anchors[index];
       if (!anchor) continue;
       const nodes = groups.get(anchor) ?? [];
       nodes.push(
@@ -1630,7 +1660,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
         <View key={`arena-summaries-${anchor}`}>{nodes}</View>,
       ]),
     );
-  }, [agent.id, serverId, streamItems, summaryPlacement.inline, workspaceId]);
+  }, [agent.id, serverId, summaryAnchorKey, summaryPlacement.inline, workspaceId]);
 
   // The active battle owns setup progress and the contestant panes in the stream.
   const activeBattle = useMemo(() => {
@@ -1649,17 +1679,6 @@ const AgentStreamSection = memo(function AgentStreamSection({
     );
   }, [agent.id, arenaBattleOnScreen, arenaSession.data, serverId, startingBattle, workspaceId]);
 
-  const streamHead = useSessionStore((state) =>
-    agentId ? state.sessions[serverId]?.agentStreamHead.get(agentId) : undefined,
-  );
-  const presentedStreamItems = usePendingArenaPrompt({
-    serverId,
-    agentId: agentId ?? "",
-    snapshot: arenaSession.data,
-    streamItems,
-    streamHead: streamHead ?? EMPTY_STREAM_ITEMS,
-    hasAppliedAuthoritativeHistory,
-  });
   const latestBattleSummary = useMemo(
     () =>
       summaryPlacement.live ? (
@@ -1821,35 +1840,44 @@ const AgentStreamSection = memo(function AgentStreamSection({
       ) : null,
     [filesState, filesRecoveryState, restoreFiles, retryInspection],
   );
+  // The summary keeps its slot when the next battle starts, so it stays mounted above the panes.
   const liveContent = useMemo(
     () =>
-      activeBattle ??
-      (latestBattleSummary || chatCallouts || filesRecoveryBanner || queuedBattlePreview ? (
+      latestBattleSummary ||
+      activeBattle ||
+      chatCallouts ||
+      filesRecoveryBanner ||
+      queuedBattlePreview ||
+      feedbackBattle ? (
         <View style={styles.arenaReadyContent}>
           {latestBattleSummary}
-          {chatCallouts}
-          {filesRecoveryBanner}
-          {queuedBattlePreview}
-          {summaryPlacement.live && !queuedBattlePreview ? (
-            <ChatFeedbackCard
-              key={`battle-feedback-${summaryPlacement.live.id}`}
-              battleId={summaryPlacement.live.id}
-              agentId={agent.id}
-              workspaceId={workspaceId}
-              promptEligible={feedbackPromptEligible}
-            />
-          ) : null}
+          {activeBattle ?? (
+            <>
+              {chatCallouts}
+              {filesRecoveryBanner}
+              {queuedBattlePreview}
+              {feedbackBattle && !queuedBattlePreview ? (
+                <ChatFeedbackCard
+                  key={`battle-feedback-${feedbackBattle.id}`}
+                  battleId={feedbackBattle.id}
+                  agentId={agent.id}
+                  workspaceId={workspaceId}
+                  promptEligible={feedbackPromptEligible}
+                />
+              ) : null}
+            </>
+          )}
         </View>
-      ) : null),
+      ) : null,
     [
       activeBattle,
       agent.id,
       chatCallouts,
+      feedbackBattle,
       feedbackPromptEligible,
       filesRecoveryBanner,
       latestBattleSummary,
       queuedBattlePreview,
-      summaryPlacement.live,
       workspaceId,
     ],
   );
@@ -1873,7 +1901,8 @@ const AgentStreamSection = memo(function AgentStreamSection({
       agentId={agent.id}
       serverId={serverId}
       context={agent}
-      streamItems={presentedStreamItems}
+      streamItems={presentedStream.tail}
+      streamHead={presentedStream.head}
       pendingPermissions={pendingPermissions}
       routeBottomAnchorRequest={routeBottomAnchorRequest}
       isAuthoritativeHistoryReady={hasAppliedAuthoritativeHistory}

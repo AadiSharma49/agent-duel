@@ -67,48 +67,95 @@ export function pendingArenaPrompt({
   return canonicalPromptPresent || promptBeforeLoadedPage ? null : turn;
 }
 
+export interface ArenaPresentedStream {
+  tail: StreamItem[];
+  head: StreamItem[];
+}
+
 /** A presentation-only row: never put this projection back into the session store. */
 export function projectPendingArenaPrompt(
-  tail: StreamItem[],
+  stream: ArenaPresentedStream,
   turn: ArenaSnapshot["turn"] | null,
-): StreamItem[] {
-  if (!turn || turn.state !== "complete") return tail;
+): ArenaPresentedStream {
+  if (!turn || turn.state !== "complete") return stream;
   const timestamp = new Date(turn.createdAt);
   const prompt = createUserMessage({
     id: `arena-prompt:${turn.id}`,
     text: turn.prompt,
     timestamp,
   });
+  const { tail, head } = stream;
   // Assistant timestamps can refresh during replay. Use the next user prompt as
   // the boundary so the previous answer stays with its original turn.
-  const nextItem = tail.findIndex(
+  const nextItem = [...tail, ...head].findIndex(
     (item) => item.kind === "user_message" && item.timestamp > timestamp,
   );
-  const index = nextItem < 0 ? tail.length : nextItem;
-  return [...tail.slice(0, index), prompt, ...tail.slice(index)];
+  const index = nextItem < 0 ? tail.length + head.length : nextItem;
+  if (index <= tail.length) {
+    return { tail: [...tail.slice(0, index), prompt, ...tail.slice(index)], head };
+  }
+  // The head can still hold the end of the previous answer: a grafted winner sends no turn
+  // completion to move it into the tail. Left in the head, it would draw below the prompt.
+  const settled = index - tail.length;
+  return { tail: [...tail, ...head.slice(0, settled), prompt], head: head.slice(settled) };
 }
 
-export function arenaSummaryAnchor(
+interface ArenaAnchorItem {
+  id: string;
+  kind: string;
+  messageId?: string;
+}
+
+function canonicalPromptIndex(
   item: ArenaHistoryItem,
-  streamItems: ReadonlyArray<{
-    id: string;
-    kind: string;
-    messageId?: string;
-  }>,
-): string | null {
-  if (!item.canonicalUserMessageID) return null;
-  const userIndex = streamItems.findIndex(
+  streamItems: ReadonlyArray<ArenaAnchorItem>,
+): number {
+  if (!item.canonicalUserMessageID) return -1;
+  return streamItems.findIndex(
     (streamItem) =>
       streamItem.kind === "user_message" &&
       (streamItem.messageId === item.canonicalUserMessageID ||
         streamItem.id === item.canonicalUserMessageID),
   );
+}
+
+export function arenaSummaryAnchor(
+  item: ArenaHistoryItem,
+  streamItems: ReadonlyArray<ArenaAnchorItem>,
+): string | null {
+  const userIndex = canonicalPromptIndex(item, streamItems);
   if (userIndex < 0) return null;
   const nextUserOffset = streamItems
     .slice(userIndex + 1)
     .findIndex((streamItem) => streamItem.kind === "user_message");
   const endIndex = nextUserOffset < 0 ? streamItems.length - 1 : userIndex + nextUserOffset;
   return streamItems[endIndex]?.id ?? null;
+}
+
+/**
+ * Each summary's anchor, searched over tail and head. A grafted winner sends no turn completion,
+ * so its turn can stay in the head until the next canonical event; in a chat whose history has
+ * not loaded yet, the whole turn is there.
+ */
+export function arenaSummaryAnchors(
+  history: readonly ArenaHistoryItem[],
+  stream: ArenaPresentedStream,
+): (string | null)[] {
+  const items = [...stream.tail, ...stream.head];
+  return history.map((item) => arenaSummaryAnchor(item, items));
+}
+
+/**
+ * Whether the chat has moved past this battle's turn: a later prompt, such as a Battle-off reply,
+ * follows it. Its summary then belongs under its turn rather than below everything after it.
+ */
+export function arenaTurnFollowedUp(item: ArenaHistoryItem, stream: ArenaPresentedStream): boolean {
+  const items = [...stream.tail, ...stream.head];
+  const userIndex = canonicalPromptIndex(item, items);
+  return (
+    userIndex >= 0 &&
+    items.slice(userIndex + 1).some((streamItem) => streamItem.kind === "user_message")
+  );
 }
 
 export function partitionArenaSummaries(
