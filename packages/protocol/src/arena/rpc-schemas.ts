@@ -428,6 +428,10 @@ export const ArenaSnapshotSchema = z
     singleAgent: z
       .object({
         id: z.string(),
+        modelSize: z.enum(["medium", "frontier"]),
+        ratingRequired: z.boolean(),
+        completed: z.boolean(),
+        stopped: z.boolean(),
         revealed: z.boolean(),
         vote: z.enum(["up", "down"]).optional(),
         identity: ArenaIdentitySchema.optional(),
