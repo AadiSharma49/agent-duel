@@ -1,6 +1,7 @@
 import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
 import { getAttachmentStore } from "@/attachments/store";
 import { hideHistoryImage, resolveHistoryImage } from "@/attachments/history-image";
+import { hideArenaPartImage, resolveArenaPartImage } from "@/attachments/arena-part-image";
 import type { AttachmentMetadata, SaveAttachmentInput } from "@/attachments/types";
 
 const activePersistence = new Set<Promise<AttachmentMetadata>>();
@@ -105,6 +106,9 @@ async function attachmentBase64(
   if (attachment.storageType === "daemon-history") {
     return dataUrlBase64(await resolveHistoryImage(attachment));
   }
+  if (attachment.storageType === "arena-part") {
+    return dataUrlBase64(await resolveArenaPartImage(attachment));
+  }
   return await store.encodeBase64({ attachment });
 }
 
@@ -142,9 +146,9 @@ export async function encodeAttachmentsForSend(
 
 export async function resolveAttachmentPreviewUrl(attachment: AttachmentMetadata): Promise<string> {
   if (attachment.storageType === "inline") return attachment.storageKey;
-  if (attachment.storageType === "daemon-history") {
+  if (attachment.storageType === "daemon-history")
     return await resolveHistoryImage(attachment, true);
-  }
+  if (attachment.storageType === "arena-part") return await resolveArenaPartImage(attachment, true);
   const store = await getAttachmentStore();
   return await store.resolvePreviewUrl({ attachment });
 }
@@ -156,6 +160,10 @@ export async function releaseAttachmentPreviewUrl(input: {
   if (input.attachment.storageType === "inline") return;
   if (input.attachment.storageType === "daemon-history") {
     hideHistoryImage(input.attachment);
+    return;
+  }
+  if (input.attachment.storageType === "arena-part") {
+    hideArenaPartImage(input.attachment);
     return;
   }
   const store = await getAttachmentStore();
@@ -174,7 +182,11 @@ export async function deleteAttachments(
   const store = await getAttachmentStore();
   await Promise.all(
     attachments.map(async (attachment) => {
-      if (attachment.storageType === "inline" || attachment.storageType === "daemon-history")
+      if (
+        attachment.storageType === "inline" ||
+        attachment.storageType === "daemon-history" ||
+        attachment.storageType === "arena-part"
+      )
         return;
       try {
         await store.delete({ attachment });
