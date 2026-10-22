@@ -18,7 +18,7 @@ import {
   resolutionRetryDetail,
   RESOLVING_BATTLE_STATES,
 } from "./battle-result";
-import { canRequestBattleDiff, hasBattleDiff } from "./comparison-visibility";
+import { canRequestBattleDiff, canReviewBattle, hasBattleDiff } from "./comparison-visibility";
 import { comparisonDiff, threeWayFile } from "./review-fixtures.test-helpers";
 import {
   arenaSummaryAnchor,
@@ -106,6 +106,44 @@ describe("arenaSummaryAnchors", () => {
     expect(stream.tail.length).toBeGreaterThan(1);
     expect(stream.head).toHaveLength(1);
     expect(arenaSummaryAnchors([historyItem], stream)).toEqual([stream.head[0].id]);
+  });
+});
+
+describe("arenaSummaryAnchors in chat order", () => {
+  it("follows the work the turn's answer moved above, not the answer", () => {
+    // The chat shows the answer first and the work that led to it beneath (`orderArenaChat`);
+    // anchoring to the answer put the summary between them once a later prompt followed.
+    const prompt = createUserMessage({
+      messageId: "user-1",
+      text: "Battle prompt",
+      timestamp: new Date(historyItem.createdAt),
+    });
+    const work = {
+      id: "call-1",
+      kind: "tool_call",
+      timestamp: new Date(historyItem.createdAt),
+      payload: {
+        source: "agent",
+        data: {
+          provider: "opencode",
+          callId: "call-1",
+          name: "shell",
+          status: "completed",
+          error: null,
+          detail: { type: "shell", command: "ls" },
+        },
+      },
+    } as StreamItem;
+    const answer = { id: "answer-1", kind: "assistant_message", text: "Done" } as StreamItem;
+    const reply = createUserMessage({
+      clientMessageId: "reply",
+      text: "Battle-off follow-up",
+      timestamp: new Date("2026-08-12T00:05:00Z"),
+    });
+
+    expect(
+      arenaSummaryAnchors([historyItem], { tail: [prompt, work, answer, reply], head: [] }),
+    ).toEqual(["call-1"]);
   });
 });
 
@@ -292,6 +330,36 @@ describe("canRequestBattleDiff", () => {
     expect(canRequestBattleDiff("applying")).toBe(true);
     expect(canRequestBattleDiff("complete")).toBe(true);
     expect(canRequestBattleDiff("discarded")).toBe(true);
+  });
+});
+
+describe("canReviewBattle", () => {
+  const turn = (input: Partial<NonNullable<ArenaSnapshot["turn"]>>): ArenaSnapshot["turn"] => ({
+    id: "turn-1",
+    index: 0,
+    state: "awaiting_vote",
+    prompt: "make it faster",
+    baseSHA: "abc",
+    comparisonState: "complete",
+    canVote: true,
+    canTie: true,
+    canDiscardBattle: false,
+    canResumeBattle: false,
+    canRetryResolution: false,
+    revealed: false,
+    createdAt: "2026-10-14T10:00:00.000Z",
+    updatedAt: "2026-10-14T10:00:00.000Z",
+    ...input,
+  });
+
+  it("shows the summary and changes once the vote opens", () => {
+    expect(canReviewBattle(turn({}))).toBe(true);
+  });
+
+  it("hides them while a battle the restart cut off waits to resume", () => {
+    expect(
+      canReviewBattle(turn({ canVote: false, canDiscardBattle: true, canResumeBattle: true })),
+    ).toBe(false);
   });
 });
 

@@ -3211,9 +3211,7 @@ describe("Arena service vertical slice", () => {
       await waitForTurn(memory.store, turnID, "awaiting_stop_resolution")
       const runs = await memory.store.runsForTurn(turnID)
       expect(runs.map((run) => [run.side, run.runState, run.selectable])).toEqual(
-        runs.map((run) =>
-          run.side === failed.side ? [run.side, "error", false] : [run.side, "complete", true],
-        ),
+        runs.map((run) => (run.side === failed.side ? [run.side, "error", false] : [run.side, "complete", true])),
       )
       const keep = failed.side === "a" ? "apply_b" : "apply_a"
       await json<PublicSnapshot>(
@@ -5399,8 +5397,7 @@ describe("Arena service vertical slice", () => {
         a: { commit: string; ref?: string }
         b: { commit: string; ref?: string }
         treesEqual: boolean
-        patch: string
-        divergence?: { conflicted: boolean; files: { file: string; status: string }[] }
+        files: { file: string; status: string }[]
       }
       const partial = await json<Diff>(await request(`/arena/turns/${turnID}/diff`, { headers }))
       expect(partial).toMatchObject({
@@ -5410,9 +5407,15 @@ describe("Arena service vertical slice", () => {
       })
       expect(partial.b.ref).toBeUndefined()
       // The missing side is the base itself, so every file is A's alone and nothing conflicts.
-      expect(partial.divergence?.conflicted).toBe(false)
-      expect(partial.divergence?.files.length).toBeGreaterThan(0)
-      expect(partial.divergence?.files.every((file) => file.status === "only_a")).toBe(true)
+      expect(partial.files.length).toBeGreaterThan(0)
+      expect(partial.files.every((file) => file.status === "only_a")).toBe(true)
+      const first = partial.files[0]!.file
+      const read = await json<{ file: { file: string; a?: { missing: boolean } }; divergence: { status: string } }>(
+        await request(`/arena/turns/${turnID}/diff/file?${new URLSearchParams({ path: first })}`, { headers }),
+      )
+      expect(read.file.file).toBe(first)
+      expect(read.file.a?.missing).toBe(false)
+      expect(read.divergence.status).toBe("only_a")
 
       delete (a as Mutable).finalCommit
       delete (a as Mutable).finalTree
@@ -5423,7 +5426,7 @@ describe("Arena service vertical slice", () => {
         a: { commit: stopped.frozenBaseSHA },
         b: { commit: stopped.frozenBaseSHA },
         treesEqual: true,
-        patch: "",
+        files: [],
       })
       expect(diff.a.ref).toBeUndefined()
       expect(diff.b.ref).toBeUndefined()
@@ -6103,4 +6106,116 @@ describe("Arena service vertical slice", () => {
       router.restore()
     }
   }, 30_000)
+
+  test("copies the winner's subagent session under the chat, so the chat keeps its transcript", async () => {
+    await using directory = await tmpdir({
+      git: true,
+      config: { formatter: false, lsp: false, watcher: { ignore: [".git"] } },
+    })
+    await $`git add opencode.json`.cwd(directory.path).quiet()
+    await $`git commit -m "test: configure subagent graft fixture"`.cwd(directory.path).quiet()
+    const memory = memoryStore()
+    const turnPrompt = "Delegate the reading, then answer."
+    const childPrompt = "child-only reading"
+    const text = (content: unknown) => (typeof content === "string" ? content : JSON.stringify(content ?? ""))
+    let generation = 0
+    const router = installOpenRouterStub({
+      respond: ({ model, messages }) => {
+        const key = `${model}-${++generation}`
+        const last = messages.at(-1)
+        if (messages.some((message) => message.role === "user" && text(message.content).includes(childPrompt))) {
+          return contestantResponse(model, 1, undefined, false, undefined, key)
+        }
+        if (last?.role === "user" && text(last.content).includes(turnPrompt)) {
+          const base = { id: `chatcmpl-${key}`, object: "chat.completion.chunk", model }
+          const call = {
+            description: "Child reading",
+            prompt: childPrompt,
+            subagent_type: "general",
+            background: false,
+          }
+          return chunks([
+            { ...base, choices: [{ index: 0, delta: { role: "assistant" } }] },
+            {
+              ...base,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: `call-${key}`,
+                        type: "function",
+                        function: { name: "task", arguments: JSON.stringify(call) },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              ...base,
+              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 },
+            },
+            "[DONE]",
+          ])
+        }
+        return contestantResponse(model, 3, undefined, false, undefined, key)
+      },
+    })
+    process.env.OPENCODE_ARENA = "1"
+    setStoreForTest(memory.store)
+
+    try {
+      const headers = { "content-type": "application/json", "x-opencode-directory": directory.path }
+      const source = await json<{ id: string }>(
+        await request("/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            title: "Subagent graft",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          }),
+        }),
+      )
+      const attached = await json<PublicSnapshot>(await request(`/arena/sessions/${source.id}`, { headers }))
+      const admitted = await json<PublicSnapshot>(
+        await request(`/arena/chats/${attached.chat.id}/turns`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: turnPrompt }),
+        }),
+      )
+      const turnID = admitted.turn!.id
+      await waitForTurn(memory.store, turnID, "awaiting_vote", 60_000)
+      const winner = (await memory.store.runsForTurn(turnID)).find((run) => run.side === "a")!
+      expect(winner.descendantSessionIDs).toHaveLength(1)
+      await json<PublicSnapshot>(
+        await request(`/arena/turns/${turnID}/vote`, { method: "POST", headers, body: JSON.stringify({ vote: "a" }) }),
+      )
+      await waitForTurn(memory.store, turnID, "complete")
+
+      const children = await json<Array<{ id: string; parentID?: string }>>(
+        await request(`/session/${source.id}/children`, { headers }),
+      )
+      expect(children).toHaveLength(1)
+      const copy = children[0]!
+      expect(copy.id).not.toBe(winner.descendantSessionIDs[0])
+      expect((await memory.store.turn(turnID))?.canonicalSubagentSessionIDs).toEqual([copy.id])
+
+      type Message = {
+        parts: ReadonlyArray<{ type?: string; tool?: string; state?: { metadata?: { sessionId?: string } } }>
+      }
+      const chat = await json<Message[]>(await request(`/session/${source.id}/message`, { headers }))
+      const task = chat.flatMap((message) => message.parts).find((part) => part.tool === "task")
+      expect(task?.state?.metadata?.sessionId).toBe(copy.id)
+      const transcript = await json<Message[]>(await request(`/session/${copy.id}/message`, { headers }))
+      expect(JSON.stringify(transcript)).toContain(childPrompt)
+      expect(JSON.stringify(transcript)).not.toContain("/.agent-duel/worktrees/")
+    } finally {
+      router.restore()
+    }
+  }, 90_000)
 })
