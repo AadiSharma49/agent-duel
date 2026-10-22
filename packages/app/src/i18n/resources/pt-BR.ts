@@ -656,6 +656,21 @@ export const ptBR: TranslationResources = {
       },
     },
     git: {
+      remoteSignIn: {
+        trigger: "Entrar em {{host}}",
+        title: "É necessário entrar",
+        description: "O Agent Duel não consegue buscar atualizações de {{host}} sem login.",
+        sshDescription:
+          "{{host}} não aceitou sua chave SSH, então o Agent Duel não consegue buscar atualizações. Carregue a chave com ssh-add ou adicione-a à sua conta em {{host}}.",
+        username: "Usuário",
+        password: "Senha ou token",
+        signIn: "Entrar",
+        signingIn: "Entrando...",
+        signedIn: "Conectado a {{host}}",
+        loginNotKept:
+          "Conectado, mas o Git não guardou o login, então a próxima busca vai pedi-lo de novo. Para mantê-lo, configure um auxiliar de credenciais do Git ou mude o origin para SSH.",
+        failed: "Falha ao entrar: {{reason}}",
+      },
       actions: {
         moreOptions: "Mais opções",
         moreActions: "Mais ações",
