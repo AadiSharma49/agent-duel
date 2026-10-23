@@ -53,7 +53,7 @@ import { TRASH_DIRNAME } from "@/util/discard-tree"
 import { LOCAL_STATE_DIRNAME, localStatePath, PRIVATE_REF_PREFIXES } from "@/worktree/layout"
 import { ignoreForFileProviderSync } from "@/util/file-provider-ignore"
 import { isRecord } from "@/util/record"
-import { generate as generateComparison } from "./comparison"
+import { generate as generateComparison, skip as skipComparison } from "./comparison"
 import { canonicalizeArenaEnvironment, canonicalizeTranscriptPaths, localizeArenaEnvironment } from "./canonical-path"
 import { comparisonTimeline } from "./comparison-timeline"
 import { ArenaContestant, contestantPermissions } from "./contestant"
@@ -89,6 +89,7 @@ import {
   battleRefs,
   compare,
   comparisonFiles,
+  comparisonTrees,
   containsCommit,
   diffHostRefs,
   finalize,
@@ -4579,6 +4580,37 @@ export const layer: Layer.Layer<
       b: { result: Pick<FinalizedResult, "finalCommit">; transcript: string; artifactID: string },
       canonical: string,
     ) {
+      const runs = yield* promise(() => store.runsForTurn(turn._id))
+      const finished = (side: Side) => runs.find((run) => run._id === turn.runIDs[side])?.runState === "complete"
+      // A failed side leaves nothing to weigh the other side against, so only a battle both sides
+      // finished pays for a report. The first turn still asks for the chat's name.
+      if (!finished("a") || !finished("b")) {
+        yield* promise(() => store.updateTurn(turn._id, { comparisonState: "skipped" }))
+        const commits = {
+          canonical,
+          baseCommit: turn.frozenBaseSHA,
+          aCommit: a.result.finalCommit,
+          bCommit: b.result.finalCommit,
+        }
+        const trees = yield* withGit(comparisonTrees(commits)).pipe(Effect.mapError(error))
+        const skipped = yield* promise(() =>
+          skipComparison({
+            turnID: turn._id,
+            turnIndex: turn.turnIndex,
+            userPrompt: turn.userPrompt,
+            userAttachments: ArenaAttachments.describeForJudge(turn.userAttachments),
+            baseCommit: commits.baseCommit,
+            aCommit: commits.aCommit,
+            bCommit: commits.bCommit,
+            baseTree: trees.base,
+            aTree: trees.a,
+            bTree: trees.b,
+            artifactIDs: [a.artifactID, b.artifactID],
+          }),
+        )
+        yield* promise(() => store.saveSkippedComparison(skipped))
+        return
+      }
       yield* promise(() => store.updateTurn(turn._id, { comparisonState: "running" }))
       const evidence = yield* withGit(
         compare({
