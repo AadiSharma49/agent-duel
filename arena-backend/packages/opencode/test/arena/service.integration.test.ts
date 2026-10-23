@@ -10,6 +10,8 @@ import { rename, rm, stat, writeFile } from "fs/promises"
 import fs from "fs/promises"
 import * as CopySnapshot from "@/arena/copy-snapshot"
 import * as ArenaGit from "@/arena/git"
+import * as GitState from "@/worktree/git-state"
+import * as AssignmentClient from "@/arena/assignment-client"
 import { Store } from "@/arena/mongo"
 import { connectLocalStore } from "@/arena/local-store"
 import type { Frame } from "@/arena/stream"
@@ -810,6 +812,69 @@ afterEach(async () => {
   await resetDatabase()
 })
 
+// Starts a battle in a fresh checkout whose worktree host copy fails the way it did on a tester's
+// Windows laptop, when a scanner held the fresh copy.
+async function startUncopyableBattle(memory: ReturnType<typeof memoryStore>) {
+  const directory = await tmpdir({
+    git: true,
+    config: { formatter: false, lsp: false, watcher: { ignore: [".git"] } },
+  })
+  await $`git add opencode.json`.cwd(directory.path).quiet()
+  await $`git commit -m "test: configure failed creation fixture"`.cwd(directory.path).quiet()
+  process.env.OPENCODE_ARENA = "1"
+  setStoreForTest(memory.store)
+  const held = spyOn(GitState, "copyGitState").mockRejectedValue(
+    Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" }),
+  )
+  const headers = { "content-type": "application/json", "x-opencode-directory": directory.path }
+  const source = await json<{ id: string }>(
+    await request("/session", { method: "POST", headers, body: JSON.stringify({ title: "Failed creation" }) }),
+  )
+  const attached = await json<PublicSnapshot>(await request(`/arena/sessions/${source.id}`, { headers }))
+  const admitted = await json<PublicSnapshot>(
+    await request(`/arena/chats/${attached.chat.id}/turns`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ prompt: "This battle cannot prepare its worktrees." }),
+    }),
+  )
+  const turnID = admitted.turn?.id
+  if (!turnID) throw new Error("Arena did not admit the failing battle")
+  return { directory, held, headers, sessionID: source.id, turnID }
+}
+
+async function waitForTurnState(memory: ReturnType<typeof memoryStore>, turnID: string, state: string) {
+  const deadline = Date.now() + 20_000
+  let turn = await memory.store.turn(turnID)
+  while (turn?.state !== state && Date.now() < deadline) {
+    await Bun.sleep(10)
+    turn = await memory.store.turn(turnID)
+  }
+  if (turn?.state !== state) throw new Error(`Arena turn stayed ${turn?.state}, expected ${state}`)
+  return turn
+}
+
+/** A battle that never started ends discarded, with nobody named and both sides settled. */
+async function expectBlindAbort(memory: ReturnType<typeof memoryStore>, turnID: string, reason: string) {
+  const ended = await waitForTurnState(memory, turnID, "discarded")
+  expect(ended.resolution).toEqual({ kind: "aborted", reason, revealed: false })
+  expect(ended.placement.a.model).toBeUndefined()
+  expect(ended.placement.b.model).toBeUndefined()
+  expect(ended.revealAt).toBeUndefined()
+  const runs = await memory.store.runsForTurn(turnID)
+  expect(runs).toHaveLength(2)
+  for (const run of runs) {
+    expect(run.runState).toBe("error")
+    expect(run.completedAt).toBeDefined()
+  }
+  const stored = JSON.stringify({ turn: ended, runs })
+  for (const profile of testProfiles) {
+    expect(stored).not.toContain(profile.slug)
+    expect(stored).not.toContain(profile.displayName)
+  }
+  expect((await memory.store.chat(ended.chatID))?.status).toBe("ready")
+}
+
 describe("Arena service vertical slice", () => {
   for (const action of ["send", "archive"] as const) {
     test(`keeps warm ownership local while another chat starts (${action})`, async () => {
@@ -1011,6 +1076,186 @@ describe("Arena service vertical slice", () => {
       expect(testProfiles.map((profile) => profile.displayName)).toContain(publicAfterVote.turn?.identities?.a.name)
       expect(testProfiles.map((profile) => profile.displayName)).toContain(publicAfterVote.turn?.identities?.b.name)
     } finally {
+      router.restore()
+    }
+  }, 30_000)
+
+  test("ends a battle that fails while it is being created without naming either side", async () => {
+    await using directory = await tmpdir({
+      git: true,
+      config: { formatter: false, lsp: false, watcher: { ignore: [".git"] } },
+    })
+    await $`git add opencode.json`.cwd(directory.path).quiet()
+    await $`git commit -m "test: configure failed creation fixture"`.cwd(directory.path).quiet()
+    const memory = memoryStore()
+    const router = installOpenRouterStub()
+    process.env.OPENCODE_ARENA = "1"
+    setStoreForTest(memory.store)
+    // What a tester's Windows laptop answered when a scanner held the fresh host copy.
+    const held = spyOn(GitState, "copyGitState").mockRejectedValue(
+      Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" }),
+    )
+
+    try {
+      const headers = { "content-type": "application/json", "x-opencode-directory": directory.path }
+      const source = await json<{ id: string }>(
+        await request("/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "Failed creation" }),
+        }),
+      )
+      const attached = await json<PublicSnapshot>(await request(`/arena/sessions/${source.id}`, { headers }))
+      const admitted = await json<PublicSnapshot>(
+        await request(`/arena/chats/${attached.chat.id}/turns`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: "This battle cannot prepare its worktrees." }),
+        }),
+      )
+      const turnID = admitted.turn?.id
+      if (!turnID) throw new Error("Arena did not admit the failing battle")
+
+      const deadline = Date.now() + 20_000
+      let failed = await memory.store.turn(turnID)
+      while (failed?.state !== "discarded" && Date.now() < deadline) {
+        await Bun.sleep(10)
+        failed = await memory.store.turn(turnID)
+      }
+      if (failed?.state !== "discarded") throw new Error(`Arena failed battle stayed ${failed?.state}`)
+      expect(held).toHaveBeenCalled()
+      expect(failed.transitionTimestamps.creation_failed).toBeDefined()
+      expect(failed.resolution).toEqual({
+        kind: "aborted",
+        reason: "Arena battle failed before resolution",
+        revealed: false,
+      })
+      expect(failed.placement.a.model).toBeUndefined()
+      expect(failed.placement.b.model).toBeUndefined()
+      expect(failed.revealAt).toBeUndefined()
+
+      const runs = await memory.store.runsForTurn(turnID)
+      expect(runs).toHaveLength(2)
+      for (const run of runs) {
+        expect(run.runState).toBe("error")
+        expect(run.completedAt).toBeDefined()
+      }
+      const stored = JSON.stringify({ turn: failed, runs })
+      for (const profile of testProfiles) {
+        expect(stored).not.toContain(profile.slug)
+        expect(stored).not.toContain(profile.displayName)
+      }
+
+      const shown = await json<PublicSnapshot & { history: ReadonlyArray<{ id: string; identities?: unknown }> }>(
+        await request(`/arena/turns/${turnID}`, { headers }),
+      )
+      expect(shown.chat.status).toBe("ready")
+      expect(shown.turn?.revealed).toBe(false)
+      expect(shown.turn?.identities).toBeUndefined()
+      expect(shown.runs.every((run) => run.identity === undefined)).toBe(true)
+      expect(shown.history.find((item) => item.id === turnID)?.identities).toBeUndefined()
+    } finally {
+      held.mockRestore()
+      router.restore()
+    }
+  }, 30_000)
+
+  test("ends a battle that fails to start even when the control plane cannot answer", async () => {
+    const memory = memoryStore()
+    const router = installOpenRouterStub()
+    const unreachable = spyOn(AssignmentClient, "resolveAssignments").mockRejectedValue(
+      new Error("Arena control plane is unreachable"),
+    )
+    const failed = await startUncopyableBattle(memory)
+    await using _directory = failed.directory
+    try {
+      await expectBlindAbort(memory, failed.turnID, "Arena battle failed before resolution")
+      expect(unreachable).toHaveBeenCalled()
+    } finally {
+      unreachable.mockRestore()
+      failed.held.mockRestore()
+      router.restore()
+    }
+  }, 30_000)
+
+  test("Try again after a failed start runs in the same chat", async () => {
+    const memory = memoryStore()
+    const router = installOpenRouterStub()
+    await using directory = await tmpdir({
+      git: true,
+      config: { formatter: false, lsp: false, watcher: { ignore: [".git"] } },
+    })
+    await $`git add opencode.json`.cwd(directory.path).quiet()
+    await $`git commit -m "test: configure retried creation fixture"`.cwd(directory.path).quiet()
+    process.env.OPENCODE_ARENA = "1"
+    setStoreForTest(memory.store)
+    // The copy is complete but its rename fails, as on the tester's laptop: a `.partial` copy
+    // is left in the chat's fresh worktree directory.
+    const held = spyOn(GitState, "copyGitState").mockImplementationOnce(async (input) => {
+      await fs.mkdir(`${input.target}.partial/refs`, { recursive: true })
+      await writeFile(`${input.target}.partial/HEAD`, "ref: refs/heads/main\n")
+      throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" })
+    })
+    try {
+      const headers = { "content-type": "application/json", "x-opencode-directory": directory.path }
+      const source = await json<{ id: string }>(
+        await request("/session", { method: "POST", headers, body: JSON.stringify({ title: "Retried creation" }) }),
+      )
+      const attached = await json<PublicSnapshot>(await request(`/arena/sessions/${source.id}`, { headers }))
+      const send = async () => {
+        const admitted = await json<PublicSnapshot>(
+          await request(`/arena/chats/${attached.chat.id}/turns`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: "Produce two blinded results." }),
+          }),
+        )
+        if (!admitted.turn?.id) throw new Error("Arena did not admit the battle")
+        return admitted.turn.id
+      }
+      const failed = await send()
+      await expectBlindAbort(memory, failed, "Arena battle failed before resolution")
+      const retried = await send()
+      // The leftover copy must not reach the next battle's base as untracked work.
+      const settled = await waitForTurn(memory.store, retried, "awaiting_vote")
+      expect(settled.frozenBaseSHA).toBe((await $`git rev-parse HEAD`.cwd(directory.path).quiet().text()).trim())
+      expect((await memory.store.runsForTurn(retried)).map((run) => run.runState)).toEqual(["complete", "complete"])
+    } finally {
+      held.mockRestore()
+      router.restore()
+    }
+  }, 60_000)
+
+  test("archives a chat whose battle failed to start without naming either side", async () => {
+    const memory = memoryStore()
+    const router = installOpenRouterStub()
+    // The first abort fails, so the turn is still creation_failed when the workspace is archived.
+    const unrecorded = spyOn(memory.store, "recordAbort").mockRejectedValueOnce(new Error("store unavailable"))
+    const failed = await startUncopyableBattle(memory)
+    await using _directory = failed.directory
+    try {
+      await waitForTurnState(memory, failed.turnID, "creation_failed")
+      const deadline = Date.now() + 20_000
+      while (unrecorded.mock.calls.length === 0 && Date.now() < deadline) await Bun.sleep(10)
+      expect(unrecorded).toHaveBeenCalledTimes(1)
+
+      const archived = await json<PublicSnapshot>(
+        await request(`/arena/sessions/${failed.sessionID}/archive`, { method: "POST", headers: failed.headers }),
+      )
+      expect(archived.chat.status).toBe("archived")
+      const ended = await waitForTurnState(memory, failed.turnID, "discarded")
+      expect(ended.resolution).toEqual({
+        kind: "aborted",
+        reason: "Arena workspace was archived before resolution",
+        revealed: false,
+      })
+      expect(ended.placement.a.model).toBeUndefined()
+      expect(ended.placement.b.model).toBeUndefined()
+      const runs = await memory.store.runsForTurn(failed.turnID)
+      expect(runs.map((run) => run.runState)).toEqual(["error", "error"])
+    } finally {
+      unrecorded.mockRestore()
+      failed.held.mockRestore()
       router.restore()
     }
   }, 30_000)

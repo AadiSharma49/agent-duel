@@ -70,6 +70,7 @@ import {
   earlyResolution,
   chatSlug,
   generationName,
+  identitiesRevealed,
   INTERRUPTED_RUN_MESSAGE,
   isFinalState,
   isParkedPromotion,
@@ -1350,6 +1351,9 @@ export const layer: Layer.Layer<
 
     const revealTelemetry = (turn: TurnDocument, metrics: Awaited<ReturnType<typeof resolvedPlacement>>["metrics"]) =>
       promise(() => telemetry?.reveal?.({ runIDs: Object.values(turn.runIDs), metrics }) ?? Promise.resolve())
+    /** For a battle that ends unrevealed: its generations' usage stays blind and is not held for a reveal. */
+    const releaseTelemetry = (turn: TurnDocument) =>
+      promise(() => telemetry?.release?.({ runIDs: Object.values(turn.runIDs) }) ?? Promise.resolve())
 
     const inDirectory = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
       instances.provide({ directory }, effect)
@@ -6001,36 +6005,14 @@ export const layer: Layer.Layer<
               failed.state !== "interrupted_recovery"
             )
               return
-            const failureState = failed.state
-            const revealed = yield* promise(() => modelsForDecision(failed, "aborted"))
-            const aborted = yield* promise(() =>
-              store.recordAbort({
-                turnID: activeTurn._id,
-                expectedState: failureState,
-                reason: "Arena battle failed before resolution",
-                models: revealed.models,
-                at: new Date(),
-              }),
+            const aborted = yield* abortUnresolved(
+              store,
+              failed,
+              failed.state,
+              activeChat,
+              "Arena battle failed before resolution",
             )
-            if (!aborted.recorded && aborted.turn.resolution?.kind !== "aborted") return
-            yield* revealTelemetry(failed, revealed.metrics)
-            yield* promise(() => store.transitionTurn(activeTurn._id, "discarding"))
-            yield* cleanup(store, activeTurn, activeChat.repository.root)
-            const canonical = yield* withGit(inspectCanonical(activeChat.repository.root)).pipe(Effect.mapError(error))
-            yield* promise(() => store.transitionTurn(activeTurn._id, "discarded"))
-            yield* promise(() =>
-              store.completeTurn({
-                chatID: activeChat._id,
-                turnID: activeTurn._id,
-                canonicalSHA: canonical.head,
-                canonicalSessionID: activeChat.canonicalSessionID,
-                ...(canonical.branch ? { branch: canonical.branch } : {}),
-                detached: canonical.detached,
-                indexTree: canonical.indexTree,
-                trunkConflicts: canonical.conflicts,
-                completedAt: new Date(),
-              }),
-            )
+            if (!aborted) return
             yield* Effect.logError("Arena battle failed", { turnID: activeTurn._id, cause })
           }),
         ),
@@ -8108,6 +8090,98 @@ export const layer: Layer.Layer<
       )
     })
 
+    /**
+     * End a battle that failed before anyone decided it: record the abort, settle both sides, remove
+     * their worktrees and give the chat back. False when another caller recorded a different
+     * decision first.
+     *
+     * A battle that failed while it was being created is recorded before the control plane answers,
+     * so an unreachable service cannot leave it stuck, and its pair is never stored or named
+     * (`identitiesRevealed`). The control plane still resolves it in the background, which stops the
+     * assignments routing.
+     */
+    const abortUnresolved = Effect.fn("Arena.abortUnresolved")(function* (
+      store: Store,
+      turn: TurnDocument,
+      expectedState: "creation_failed" | "finalization_failed" | "interrupted_recovery",
+      chat: ChatDocument,
+      reason: string,
+    ) {
+      const reveal = expectedState !== "creation_failed"
+      const resolved = reveal ? yield* promise(() => modelsForDecision(turn, "aborted")) : undefined
+      const aborted = yield* promise(() =>
+        store.recordAbort({
+          turnID: turn._id,
+          expectedState,
+          reason,
+          ...(resolved ? { models: resolved.models } : {}),
+          at: new Date(),
+        }),
+      )
+      if (!aborted.recorded && aborted.turn.resolution?.kind !== "aborted") return false
+      if (resolved && identitiesRevealed(aborted.turn.resolution)) {
+        yield* revealTelemetry(aborted.turn, resolved.metrics)
+        yield* settleAbandonedRuns(store, turn, "interrupted", reason)
+      } else {
+        yield* promise(() => modelsForDecision(turn, "aborted")).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Arena could not resolve a battle that never started", { turnID: turn._id, cause }),
+          ),
+          Effect.forkIn(scope),
+        )
+        yield* releaseTelemetry(turn)
+        yield* settleAbandonedRuns(store, turn, "error", "Arena battle could not start")
+      }
+      yield* promise(() => store.transitionTurn(turn._id, "discarding"))
+      yield* cleanup(store, turn, chat.repository.root)
+      const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
+      yield* promise(() => store.transitionTurn(turn._id, "discarded"))
+      yield* promise(() =>
+        store.completeTurn({
+          chatID: chat._id,
+          turnID: turn._id,
+          canonicalSHA: canonical.head,
+          canonicalSessionID: chat.canonicalSessionID,
+          ...(canonical.branch ? { branch: canonical.branch } : {}),
+          detached: canonical.detached,
+          indexTree: canonical.indexTree,
+          trunkConflicts: canonical.conflicts,
+          completedAt: new Date(),
+        }),
+      )
+      return true
+    })
+
+    /**
+     * Stop and settle the sides an abandoned battle left pending. A side's first prompt can be in
+     * flight before its worktree exists, and a run left `pending` reads as working forever.
+     */
+    const settleAbandonedRuns = Effect.fnUntraced(function* (
+      store: Store,
+      turn: TurnDocument,
+      runState: "error" | "interrupted",
+      message: string,
+    ) {
+      const runs = yield* promise(() => store.runsForTurn(turn._id))
+      yield* Effect.forEach(
+        runs.filter((run) => run.runState === "pending"),
+        (run) =>
+          Effect.gen(function* () {
+            yield* cancelRun(run.worktree, SessionID.make(run.rootSessionID)).pipe(Effect.ignore)
+            yield* promise(() =>
+              store.updateRun(run._id, {
+                runState,
+                durationMs: null,
+                selectable: false,
+                error: message,
+                completedAt: new Date(),
+              }),
+            )
+          }),
+        { concurrency: 2, discard: true },
+      )
+    })
+
     const cleanup = Effect.fn("Arena.cleanup")(function* (store: Store, turn: TurnDocument, _canonical: string) {
       const chat = yield* promise(() => store.chat(turn.chatID))
       if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
@@ -8756,6 +8830,12 @@ export const layer: Layer.Layer<
               return
             }
 
+            // The previous process stopped while ending a battle that never started. Recovery would
+            // park it for Keep or Discard, which names the pair; it ends as it would have.
+            if (turn.state === "creation_failed") {
+              yield* abortUnresolved(store, turn, "creation_failed", currentChat, "Arena battle failed before resolution")
+              return
+            }
             if (
               turn.state === "creating" ||
               turn.state === "worktrees_ready" ||
@@ -8763,7 +8843,6 @@ export const layer: Layer.Layer<
               turn.state === "early_selected" ||
               turn.state === "finalizing" ||
               turn.state === "stopping" ||
-              turn.state === "creation_failed" ||
               turn.state === "finalization_failed" ||
               turn.state === "interrupted_recovery"
             ) {
@@ -10346,37 +10425,7 @@ export const layer: Layer.Layer<
           turn.state === "finalization_failed" ||
           turn.state === "interrupted_recovery"
         ) {
-          const expectedState: "creation_failed" | "finalization_failed" | "interrupted_recovery" = turn.state
-          const revealed = yield* promise(() => modelsForDecision(turn, "aborted"))
-          const recorded = yield* promise(() =>
-            store.recordAbort({
-              turnID: turn._id,
-              expectedState,
-              reason: "Arena workspace was archived before resolution",
-              models: revealed.models,
-              at: new Date(),
-            }),
-          )
-          if (recorded.recorded || recorded.turn.resolution?.kind === "aborted") {
-            yield* revealTelemetry(recorded.turn, revealed.metrics)
-            yield* promise(() => store.transitionTurn(turn._id, "discarding"))
-            yield* cleanup(store, turn, chat.repository.root)
-            const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
-            yield* promise(() => store.transitionTurn(turn._id, "discarded"))
-            yield* promise(() =>
-              store.completeTurn({
-                chatID: chat._id,
-                turnID: turn._id,
-                canonicalSHA: canonical.head,
-                canonicalSessionID: chat.canonicalSessionID,
-                ...(canonical.branch ? { branch: canonical.branch } : {}),
-                detached: canonical.detached,
-                indexTree: canonical.indexTree,
-                trunkConflicts: canonical.conflicts,
-                completedAt: new Date(),
-              }),
-            )
-          }
+          yield* abortUnresolved(store, turn, turn.state, chat, "Arena workspace was archived before resolution")
         } else if (
           turn.state === "application_failed" ||
           turn.state === "canonicalization_failed" ||

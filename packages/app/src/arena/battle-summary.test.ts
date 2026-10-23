@@ -8,15 +8,18 @@ import {
 import type {
   ArenaComparisonDiff,
   ArenaHistoryItem,
+  ArenaRun,
   ArenaSnapshot,
 } from "@getpaseo/protocol/arena/rpc-schemas";
 import {
+  battleFailedToStart,
   battleWinnerSide,
   divergenceFilesLabel,
   gitApplicationNotice,
   isResolvingBattleState,
   resolutionRetryDetail,
   RESOLVING_BATTLE_STATES,
+  settledHistoryRun,
 } from "./battle-result";
 import { canRequestBattleDiff, canReviewBattle, hasBattleDiff } from "./comparison-visibility";
 import { comparisonDiff, threeWayFile } from "./review-fixtures.test-helpers";
@@ -314,6 +317,50 @@ describe("partitionArenaSummaries", () => {
       });
     },
   );
+
+  it("shows a battle that failed to start, though it names nobody", () => {
+    const unstarted = {
+      ...historyItem,
+      id: "turn-unstarted",
+      index: 2,
+      state: "discarded",
+      canonicalUserMessageID: undefined,
+      resolution: { kind: "aborted", reason: "Arena battle failed before resolution" },
+    } as ArenaHistoryItem;
+    expect(partitionArenaSummaries([older, unstarted], false)).toEqual({
+      inline: [older],
+      live: unstarted,
+    });
+  });
+});
+
+describe("settledHistoryRun", () => {
+  it("shows a run an older build left pending in a decided battle as interrupted", () => {
+    const pending = { side: "a", runState: "pending" } as ArenaRun;
+    expect(settledHistoryRun(pending)?.runState).toBe("interrupted");
+    const complete = { side: "b", runState: "complete" } as ArenaRun;
+    expect(settledHistoryRun(complete)).toBe(complete);
+    expect(settledHistoryRun(undefined)).toBeUndefined();
+  });
+});
+
+describe("battleFailedToStart", () => {
+  it("is an abort that names neither side", () => {
+    const aborted = { resolution: { kind: "aborted", reason: "failed" } } as ArenaHistoryItem;
+    expect(battleFailedToStart(aborted)).toBe(true);
+    expect(
+      battleFailedToStart({
+        ...aborted,
+        identities: { a: { name: "Model A" }, b: { name: "Model B" } },
+      }),
+    ).toBe(false);
+    expect(
+      battleFailedToStart({
+        resolution: { kind: "stopped", resolution: "discard" },
+      } as ArenaHistoryItem),
+    ).toBe(false);
+    expect(battleFailedToStart({} as ArenaHistoryItem)).toBe(false);
+  });
 });
 
 describe("isArenaBattleUnresolved", () => {
