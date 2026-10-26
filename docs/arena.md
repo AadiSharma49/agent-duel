@@ -133,14 +133,35 @@ latest output. The battle uses no side panel tab: the card has the chat's width,
 narrow the card to show the same thing.
 
 Review has two tabs: **Difference summary**, the generated comparison, and **Changes**, the file rows with git's
-status for each pair. A row opens its file's diff right under it and closes it again, several can be open
-at once, and the first diverging file opens on arrival. Past eight rows the rest wait behind Show more, so a
+status for each pair. The review appears as soon as one side has a result (`battleReviewPhase` in
+`comparison-visibility.ts`), so the voter can read it before picking early. It opens on the
+summary tab, which says the other side is still working. Changes holds the finished side's files:
+its counts beside `working` for the other side, no verdict on a pair that is not in yet, and in
+each diff the working side's column is a hatched placeholder the size of the finished side's diff
+(one line per region in the one-column layout), so nothing moves when its result lands. Only the
+finished side expands. The engine's diff stands the
+unfinished side in as the frozen base, the shape a stopped battle already uses; a side working
+again after a reply keeps its last result's commit, so its run state decides, not the commit.
+The comparison and each file's read are keyed by the commits they compare (`arenaDiffQueryKey`,
+`comparisonRevision`), and the first result also by its phase, so they are fetched again when the
+other side lands; until they arrive the review keeps showing what it had. Keying by phase alone
+showed a side's old result after it finished a reply: the engine marks the run complete before it
+records the new commit, so the comparison fetched at that moment compares the old one. A run reads `complete`
+a moment before the engine records its commit, so a side counts as finished only once its commit is
+there; going by run state alone dropped the review out for that moment. A row opens its file's diff
+right under it and closes it again, several can be open at once, and the first diverging file opens
+on arrival. A file the card opened on the first result stays open when both are in, even though the
+first diverging file is then a different one. Past eight rows the rest wait behind Show more, so a
 battle that touched hundreds of files does not push the threads off screen; an open row past them still shows.
 The list names every file either side changed, in path order, without contents; each diff reads its own file
 when it opens (`arena.turn.get_file_diff`). Do not cap the list to bound the response: a cap hid every file B
 alone changed whenever A changed 25.
-The chevron at the end of the tab row folds the whole review away, and a tab opens it again. A ready summary opens first. When
-the review opens before the summary is ready, Changes stays open after it arrives. Changes
+The chevron at the end of the tab row folds the whole review away, and a tab opens it again. The review opens on the
+Difference summary, showing its progress while it generates; Changes opens first only when no summary
+is coming, as for a stopped battle or one where a side failed. The review mounts before the engine writes the comparison
+record, so read the turn's `comparisonState` until the record exists (`battleSummaryStatus` in
+`comparison-visibility.ts`); the review keeps the tab it opened on, and reading only the record
+opened every battle on Changes. Changes
 retries a failed read twice before showing a small manual retry. The summary generator retries
 transient network and service failures
 up to three attempts, while permanent failures such as payment or credentials remain actionable.
@@ -671,6 +692,17 @@ nonignored-untracked state in `refs/battles/<chat>/turn-<n>/base`, then draws a 
 work from that frozen state, so later canonical movement cannot shift the ground under a running
 battle.
 
+An untracked embedded repository, a directory with its own `.git` the checkout does not track, is
+frozen as its files: what that repository tracks or leaves unignored, filtered through the
+checkout's ignore rules, and never its `.git` (`stageEmbeddedRepositories` in `arena/git.ts`). The
+filter is there because a contestant has no `.git` in that directory and reads the files through the
+checkout's rules. `git add -A` cannot be used for them: it records the directory as a gitlink to a
+commit only the embedded repository holds, and fails outright on one with no commit. The vote writes
+the winner's edits back into the embedded repository as uncommitted changes. A winner that replaces
+its directory with a file is refused, since the write would delete the `.git`. A contestant that
+commits those files makes the checkout track them once it wins. A gitlink the checkout tracks,
+submodule or not, still reaches a contestant as an empty directory.
+
 **The draw** (`arena-service/src/pool.ts`). The service draws two distinct profiles uniformly from
 its pool; which one lands on side A is part of the draw. It stores the private mapping permanently
 in `arenaAssignmentSets` and returns one opaque assignment id per side. The set is account- and
@@ -957,9 +989,12 @@ vote.
 
 The comparison uses base-to-agent changes, direct A/B differences, and visible timelines. It uses the dedicated
 `POST /api/arena/comparison` route, which accepts only the expected single-message payload for an
-unresolved battle scope and always selects `minimax/minimax-m2.7` via groq in the service
-(`arena/comparison.ts`). There is no generic or unassigned comparison path through the OpenRouter
-proxy.
+unresolved battle scope and picks the model in the service (`arena-service/src/utility-model.ts`):
+Qwen 3.8 27B on Cerebras with low reasoning, and on any failure status or network error, DeepSeek
+V4.1 Flash on Baseten with reasoning off. Baseten ignores `effort: low` and reasons for thousands of
+tokens, so DeepSeek runs without it. The comparison record keeps the first choice in `model` and the
+model that answered in `resolvedModel`. There is no generic or unassigned comparison path through
+the OpenRouter proxy.
 
 The Commit and Create PR buttons get their text from the same model through
 `POST /api/arena/metadata` (`arena-service/src/metadata.ts`), never from an agent, and so do the

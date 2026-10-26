@@ -482,7 +482,17 @@ export type RunDocument = {
   firstToolAt?: Date
   completedAt?: Date
   archivedAt?: Date
+  /**
+   * Time worked across every request of the run: the first, each follow-up to it once it had
+   * finished, and each retry, failed attempts included. The wait before a follow-up is not
+   * counted. Null until the run completes.
+   */
   durationMs: number | null
+  /**
+   * Time worked in the requests before the current one. A follow-up or a retry moves `startedAt`
+   * to its own request, so the time before it is kept here.
+   */
+  priorDurationMs?: number
   runState: "pending" | "complete" | "stopped" | "error" | "interrupted"
   error?: string
   /** The error is a failed model request the engine itself would retry, so the voter may retry it. */
@@ -682,8 +692,9 @@ export type ComparisonDocument = {
   readonly truncated: boolean
   readonly omittedArtifacts: ReadonlyArray<string>
   readonly promptVersion: string
-  readonly model: "minimax/minimax-m2.7"
-  readonly provider: "groq"
+  readonly model: string
+  readonly provider: string
+  resolvedModel?: string
   resolvedProvider?: string
   requestArtifactID?: Identifier
   responseArtifactID?: Identifier
@@ -783,7 +794,7 @@ export type ReviewEventInput = {
 export const reviewFlushLimit = 500
 
 /** Bump when a derived field changes meaning, then recompute the whole table. */
-export const battleMetricsSchemaVersion = 6
+export const battleMetricsSchemaVersion = 7
 
 export type ReviewEffort = {
   /** From the card opening to the first act of reviewing, ignoring window focus events. */
@@ -848,6 +859,7 @@ export type BattleSideMetrics = {
   readonly finishReason?: string
   readonly runState: RunDocument["runState"]
   readonly runErrored: boolean
+  /** Time worked across the run's requests, follow-ups and retries included; see `RunDocument`. */
   readonly durationMs?: number
   /** Offset from the turn's start, so the sequence the voter saw can be rebuilt. */
   readonly completedAtMs?: number
