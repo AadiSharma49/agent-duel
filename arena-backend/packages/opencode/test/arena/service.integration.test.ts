@@ -22,7 +22,6 @@ import type {
   ChatDocument,
   CheckoutEvictionDocument,
   ComparisonDocument,
-  CheckoutEvictionDocument,
   GenerationDocument,
   PortCursorDocument,
   RawEventDocument,
@@ -574,6 +573,8 @@ function installOpenRouterStub(options?: {
   }
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-session",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: hashArenaControlToken(arenaControlToken),
@@ -1544,6 +1545,8 @@ describe("Arena service vertical slice", () => {
     setStoreForTest(memory.store)
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-session",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: hashArenaControlToken(arenaControlToken),
@@ -1592,6 +1595,8 @@ describe("Arena service vertical slice", () => {
     setStoreForTest(memory.store)
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-session",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: hashArenaControlToken(arenaControlToken),
@@ -1641,6 +1646,8 @@ describe("Arena service vertical slice", () => {
     setStoreForTest(memory.store)
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-session",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: hashArenaControlToken(arenaControlToken),
@@ -2428,6 +2435,8 @@ describe("Arena service vertical slice", () => {
       setStoreForTest(memory.store)
       setArenaCredentials({
         mode: "hosted",
+        researchPartition: "test-research-partition",
+        researchAccountID: "test-account",
         token: "test-session",
         controlPlaneUrl: "https://control.test",
         controlTokenHash: hashArenaControlToken(arenaControlToken),

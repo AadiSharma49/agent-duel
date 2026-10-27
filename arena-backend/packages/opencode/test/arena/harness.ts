@@ -14,7 +14,6 @@ import type {
   GenerationDocument,
   RawEventDocument,
   PortCursorDocument,
-  ReviewEventDocument,
   RunDocument,
   SessionArchiveDocument,
   SingleAgentRatingDocument,
@@ -544,6 +543,8 @@ export function installOpenRouterStub(options?: {
   }
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-session",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: hashArenaControlToken(arenaControlToken),
