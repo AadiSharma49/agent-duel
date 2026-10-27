@@ -47,6 +47,8 @@ export type StoppedResolution = {
   readonly kind: "stopped"
   readonly resolution: StopResolution
   readonly appliedSide?: Side
+  /** False for a discard of a battle neither side showed anything in; see `identitiesRevealed`. */
+  readonly revealed?: false
 }
 
 export type EarlyResolution = {
@@ -58,6 +60,8 @@ export type EarlyResolution = {
 export type AbortedResolution = {
   readonly kind: "aborted"
   readonly reason: string
+  /** False when the battle ended before either side could show anything; see `identitiesRevealed`. */
+  readonly revealed?: false
 }
 
 export type Resolution = VoteResolution | StoppedResolution | EarlyResolution | AbortedResolution
@@ -103,12 +107,16 @@ export function voteResolution(vote: Vote): VoteResolution {
   }
 }
 
-export function stoppedResolution(resolution: StopResolution): StoppedResolution {
+export function stoppedResolution(
+  resolution: StopResolution,
+  options?: { readonly revealed: false },
+): StoppedResolution {
   return {
     kind: "stopped",
     resolution,
     ...(resolution === "apply_a" ? { appliedSide: "a" as const } : {}),
     ...(resolution === "apply_b" ? { appliedSide: "b" as const } : {}),
+    ...(options ? { revealed: false as const } : {}),
   }
 }
 
@@ -116,8 +124,19 @@ export function earlyResolution(side: Side): EarlyResolution {
   return { kind: "early", vote: side, appliedSide: side }
 }
 
-export function abortedResolution(reason: string): AbortedResolution {
-  return { kind: "aborted", reason }
+export function abortedResolution(reason: string, options?: { readonly revealed: false }): AbortedResolution {
+  return { kind: "aborted", reason, ...(options ? { revealed: false as const } : {}) }
+}
+
+/**
+ * Whether a resolved turn shows who the contestants were.
+ *
+ * A decision reveals once the voter has seen the sides' work. A battle that failed while it was
+ * being created, or was discarded before either side showed anything, ends as blind as it began.
+ */
+export function identitiesRevealed(resolution: Resolution | undefined): boolean {
+  if (resolution === undefined) return false
+  return !((resolution.kind === "aborted" || resolution.kind === "stopped") && resolution.revealed === false)
 }
 
 export function isVoteReady(state: BattleState): boolean {

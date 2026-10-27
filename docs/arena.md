@@ -162,11 +162,13 @@ new battle chat's workspace shows the prompt's first line from the send and that
 comparison arrives; a workspace with any other name keeps it
 (`arena-workspace-auto-name.ts`). When both sides leave identical trees there is no report to write,
 so the first turn sends the comparison route a request for the title alone; if it fails, the chat
-keeps its prompt's first line. A chat started with Battle off also shows its prompt's first line
-from the send, and the same model renames it from that prompt through the metadata route below; if
-that fails it keeps the line. Nothing else names a chat: Paseo named workspaces with an agent, which
-here meant the user's installed Claude Code or a paid contestant with the full agent setup (up to
-$0.25 per new chat).
+keeps its prompt's first line. A turn where either side failed gets no report either, since there
+is nothing to weigh the other side against: its comparison is `skipped`, the card shows only
+Changes, and the first turn still asks for the title alone. A chat started with Battle off also
+shows its prompt's first line from the send, and the same model renames it from that prompt
+through the metadata route below; if that fails it keeps the line. Nothing else names a chat:
+Paseo named workspaces with an agent, which here meant the user's installed Claude Code or a paid
+contestant with the full agent setup (up to $0.25 per new chat).
 The card shows it whole; only a report that measures longer than a screen of the card folds to its
 opening with `Show full summary` (`verdict-body.tsx`). Trimming at the prompt was Michael's call:
 the fold spent latency on prose the voter then had to unfold. The status is `git merge-tree
@@ -748,6 +750,22 @@ earlier turn's slot; by then that path is gone or belongs to another side. Chats
 change keep their old paths, so the fork never localizes a checkout path into `.agent-duel`: it
 would name a directory inside the contestant's own worktree that does not exist.
 
+The fork also clears, for the model, the output of older tool calls the contestant can repeat
+(`pruneToolOutputBefore` in `arena/fork.ts`): those from before the chat's last finished turn
+(`lastTurnStart` in `arena/service.ts`). The last turn keeps its output, since its test runs and
+reads are the freshest context. Output the contestant cannot get back stays: a question's answers,
+a subagent's report, a skill, an MCP tool's result, and a read outside the worktree, such as an
+earlier turn's upload, which the sandbox below closes. The call and its input stay, and the model
+sees OpenCode's "[Old tool result content cleared]" placeholder instead of the output. A battle
+turn starts at its grafted prompt and includes its replies; a prompt written after the graft is a
+single-agent turn, and a steer belongs to the turn it steered. Clearing at the fork costs no cache:
+a turn draws new models and a new worktree path, so its first request never reads the previous
+turn's cache. Never prune mid-turn, which would rewrite the warm prefix. Both sides have to clear
+the same output, so the send reads the boundary once, from the transcript it freezes, and forks
+again a side whose warm fork used another. The canonical session keeps every output, so the chat's
+history, its transcript hash, and single-agent turns, which continue one model whose cache does
+survive, are unchanged.
+
 The winner's subagent sessions are copied too, under the chat's session, and its `task` calls point
 at the copies (`canonicalSubagentSessionIDs` records them so a retried graft can remove a partial
 copy). The run's own sessions are deleted with its worktree, so without the copies the chat would
@@ -815,6 +833,24 @@ results before marking their jobs complete; detached notifications can otherwise
 Arena has captured the final Git state. This behavior does not depend on the experimental
 background-subagent flag used by ordinary OpenCode sessions.
 
+The contestant instruction (`contestantSystemInstruction`) rides on the user message as `system`,
+and each request builds its system prompt from the latest user message. The system text heads the
+cached prefix: when it changes mid-turn the provider re-reads the whole conversation uncached, and a
+message without it leaves the contestant without its instructions. So a user message added in the
+middle of a turn keeps the system the turn already sends:
+
+- A child result copies the system of the parent's last user message, none included
+  (`tool/task.ts`). A single-agent turn in the canonical session follows the winner's grafted
+  prompt, and that prompt's contestant instruction is wrong for it.
+- The follow-up after automatic compaction copies the system of the prompt the compacted request
+  answered (`session/compaction.ts`). The compaction message itself carries none, since only the
+  summary request reads it.
+- A reply or a steer reuses the system the run's first prompt carried (`startedSystem`). A cold
+  side's staging note stays after staging finishes: an instruction built again would leave it out.
+  It is reused only while a fresh build, with or without that note, gives the same text. Preview
+  routes live in the engine process, so after a restart the stored preview URLs can be dead, and
+  the reply takes the new ones at the cost of one uncached request.
+
 The local OpenCode HTTP server is not an Arena client API. In Arena mode the daemon authenticates
 all session and orchestration calls with its private control token, while the OpenCode process keeps
 only a one-way verifier. The renderer and browser QA harness continue through the daemon protocol,
@@ -838,7 +874,9 @@ checkout does not ignore. The contestant is checked against the base, and in a c
 `node_modules` the exclude would drop a new package's files while its edits to tracked ones still
 apply. When both are in, the
 turn becomes `awaiting_vote` and the comparison starts in the background
-(`arena/service.ts:1968`). A failed comparison never blocks a vote.
+(`startUtility` in `arena/service.ts`). When a side failed it writes no report and skips the Git
+evidence: the comparison is `skipped` and only the first turn's title is requested. A failed
+comparison never blocks a vote.
 
 ## Blinding
 
@@ -859,7 +897,14 @@ field. Each layer has its own file:
   titles), whose prefix nothing reads back, and bodies that mark their own cache breakpoints. It
   drops `temperature`, `top_p`, and `top_k` from every request: the engine sets them without knowing
   the model, Claude and OpenAI's reasoning models accept none of them, and under the pool's
-  `require_parameters` OpenRouter would refuse only those draws, which also reveals them.
+  `require_parameters` OpenRouter would refuse only those draws, which also reveals them. It sets
+  `session_id` and `prompt_cache_key`, replacing any the engine sent, so the throughput sort keeps a
+  conversation on the provider that holds its cache. A battle side keys on its assignment id. A
+  single-agent chat draws an assignment per message, so it keys on a hash of the account and session
+  that stays the same across the chat. The same refusal rule applies to both fields, and the catalog
+  check cannot see it: run `probeRouting` (`arena-service/src/openrouter.ts`) on a pool before it
+  ships. A provider that slows down mid-turn keeps the conversation; OpenRouter leaves it only when
+  that provider is unavailable.
   Resolution disables further routing without deleting the assignment.
 - **Response** (`arena-service/src/openrouter.ts`) — before bytes return to the desktop, the control
   plane strips model, provider, fingerprint, OpenRouter metadata, and cost, replaces the generation
@@ -880,7 +925,8 @@ field. Each layer has its own file:
   provider-specific reasoning metadata, identity fields, and raw upstream errors from stored
   responses, and rewrites provider-shaped tool-call ids before saving response artifacts. The
   control plane holds generation usage, cost, and finish reason and returns them only with the
-  committed resolution. Usage keeps OpenRouter's account charge in `cost` and, when supplied, the
+  committed resolution. It also stores the provider that served each call, which no response or
+  reveal returns. Usage keeps OpenRouter's account charge in `cost` and, when supplied, the
   provider's `cost_details.upstream_inference_cost` as `upstreamInferenceCost`; the desktop then
   records both in the research metrics. Local-store startup
   removes those fields and request/response artifacts from legacy unresolved battles; resolved
@@ -1061,10 +1107,18 @@ failed single-agent send stays in the queue for editing and retry.
 ## The reveal
 
 ```
-const revealed = turn.resolution !== undefined   // arena/public.ts:198
+const revealed = identitiesRevealed(turn.resolution)   // arena/domain.ts
 ```
 
-That one line governs the public projection. Before committing a vote, the service resolves the
+That one rule governs the public projection. Every resolution reveals except the abort of a battle
+that failed while it was being created: neither side ran, so it is recorded without names before the
+control plane answers, and an unreachable service cannot hold it. The control plane resolves the
+assignments in the background, which stops their routing. Its usage is never persisted, since
+nothing reveals it. The chat shows **Battle couldn't start**, and **Try again** sends
+the same prompt as a new battle with a new pair. A discard of a battle in which neither side
+showed the voter anything, no text, reasoning or tool call after the prompt (both failed on their first
+request, or were stopped before answering), is recorded without names too (`anySideShowedOutput`);
+the card reads **Battle discarded**. One side's output is enough to reveal both. Before committing a vote, the service resolves the
 assignment on the control plane. Resolution accepts only the final decisions defined for that kind
 of assignment. The first decision is immutable; a retry returns that committed decision and the
 desktop honours it instead of applying a later choice. Only then does the control plane return
@@ -1108,10 +1162,14 @@ frontier assignment, because released desktop builds send none and route as `con
 `arena/domain.ts:63` holds the legal-transition table: 19 states, an explicit map, and
 `requireTransition` for the compare-and-set call sites. Read it before adding a state.
 
-Failure has first-class states rather than an abort — `creation_failed`, `finalization_failed`,
-`application_failed`, `canonicalization_failed` — each transitioning back into the step it failed,
-so a resolution can be retried instead of losing the battle. `interrupted_recovery` is where a turn
-lands when the daemon dies mid-battle.
+Failure has first-class states — `creation_failed`, `finalization_failed`, `application_failed`,
+`canonicalization_failed`. The last two come after the decision and transition back into the step
+they failed, so a resolution can be retried instead of losing the battle. A battle that fails
+before anyone decides it is aborted at once (`abortUnresolved` in `arena/service.ts`): its pending
+sides are cancelled and settled, so no pane keeps reading as working, its worktrees go, and the chat
+is ready again. A turn startup finds in `creation_failed`, because the previous process stopped
+while ending it, is ended the same way rather than parked for Keep or Discard, which would name the
+pair. `interrupted_recovery` is where a turn lands when the daemon dies mid-battle.
 
 A battle the restart cut off goes back to the vote (`reopenInterruptedTurn`), because quitting the
 app is not a decision about the battle. A side that had finished keeps its result. A side that was
@@ -1201,6 +1259,10 @@ times out. The deadline pauses while a local tool runs or waits for approval; a 
 not be mistaken for a silent model stream. When the runtime abandons a request, the daemon's Arena
 proxy aborts its control-plane request too; otherwise the hosted function keeps streaming, and
 billing, until its own time limit.
+
+A request above the estimated savings threshold triggers compaction. Keep a new user message and
+its attachments intact while summarizing the earlier history. The summary request must be allowed
+to exceed the savings threshold; the provider's context window still applies.
 
 A compaction summary that ends idle, at its output cap, or empty must never become the history. A
 finished summary hides everything before it, so the contestant continues with no memory of its task

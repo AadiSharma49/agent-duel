@@ -53,9 +53,9 @@ import { TRASH_DIRNAME } from "@/util/discard-tree"
 import { LOCAL_STATE_DIRNAME, localStatePath, PRIVATE_REF_PREFIXES } from "@/worktree/layout"
 import { ignoreForFileProviderSync } from "@/util/file-provider-ignore"
 import { isRecord } from "@/util/record"
-import { generate as generateComparison } from "./comparison"
+import { generate as generateComparison, skip as skipComparison } from "./comparison"
 import { canonicalizeArenaEnvironment, canonicalizeTranscriptPaths, localizeArenaEnvironment } from "./canonical-path"
-import { comparisonTimeline } from "./comparison-timeline"
+import { comparisonTimeline, showedOutput } from "./comparison-timeline"
 import { ArenaContestant, contestantPermissions } from "./contestant"
 import { createBattleAssignments, createSingleAssignment, resolveAssignments } from "./assignment-client"
 import type { BattleAssignmentDecision } from "@agent-duel/arena-service/assignment-decision"
@@ -70,6 +70,7 @@ import {
   earlyResolution,
   chatSlug,
   generationName,
+  identitiesRevealed,
   INTERRUPTED_RUN_MESSAGE,
   isFinalState,
   isParkedPromotion,
@@ -89,6 +90,7 @@ import {
   battleRefs,
   compare,
   comparisonFiles,
+  comparisonTrees,
   containsCommit,
   diffHostRefs,
   finalize,
@@ -332,6 +334,22 @@ async function archivedSessions(store: Store, run: RunDocument): Promise<unknown
   const payload = ArenaTranscriptArtifact.decode(artifact)
   if (!Array.isArray(payload)) throw new Error(`Arena transcript archive is invalid: ${run._id}`)
   return payload
+}
+
+/**
+ * Whether either side showed the voter anything this turn. A discard of a battle neither did, because
+ * both failed on their first request or were stopped before answering, names nobody. A run without a
+ * recorded prompt boundary is from an older build and counts as shown.
+ */
+async function anySideShowedOutput(store: Store, turnID: string) {
+  for (const run of await store.runsForTurn(turnID)) {
+    const boundary = promptBoundary(run)
+    if (boundary === null) continue
+    if (boundary === undefined) return true
+    const sessions = await archivedSessions(store, run).catch(() => undefined)
+    if (!sessions || showedOutput(archivedMessages(sessions), boundary)) return true
+  }
+  return false
 }
 
 function archivedMessages(payload: readonly unknown[]): unknown[] {
@@ -1014,6 +1032,46 @@ type EnvironmentRelease =
   | { readonly kind: "absent" }
   | { readonly kind: "kept"; readonly reason: string }
 
+/**
+ * Where the chat's last finished turn starts in its canonical transcript. Contestant forks keep
+ * that turn's tool output (its test runs, the files it just read) and clear the output before it.
+ * A battle turn starts at its grafted prompt and holds its replies and subagent results too; a
+ * prompt written after that graft starts a single-agent turn of its own, and a steer sent while
+ * that agent worked belongs to the turn it steered.
+ */
+export function lastTurnStart(
+  turns: readonly Pick<TurnDocument, "canonicalGraftedAt" | "canonicalUserMessageID">[],
+  transcript: readonly SessionV1.WithParts[],
+) {
+  const battle = turns.findLast((turn) => turn.canonicalGraftedAt && turn.canonicalUserMessageID)
+  const graftedAt = battle?.canonicalGraftedAt ? new Date(battle.canonicalGraftedAt).getTime() : -Infinity
+  const isPrompt = (message: SessionV1.WithParts) =>
+    message.info.role === "user" &&
+    message.info.time.created > graftedAt &&
+    message.parts.some((part) => part.type === "text" && !part.synthetic)
+  let index = transcript.findLastIndex(isPrompt)
+  while (index >= 0 && steered(transcript, index)) {
+    const steer = index
+    index = transcript.findLastIndex((message, at) => at < steer && isPrompt(message))
+  }
+  return transcript[index]?.info.id ?? battle?.canonicalUserMessageID
+}
+
+/**
+ * Whether the user message at `index` reached the agent before its turn ended, the way the prompt
+ * loop decides: the reply before it was still being written, or stopped only to call tools or to
+ * recover from a cut-off response. A reply that failed or was aborted ended its turn.
+ */
+function steered(transcript: readonly SessionV1.WithParts[], index: number) {
+  const reply = transcript.slice(0, index).findLast((message) => message.info.role === "assistant")?.info
+  if (reply?.role !== "assistant" || reply.error) return false
+  const sent = transcript[index].info.time.created
+  if (reply.time.completed === undefined || reply.time.completed > sent) return true
+  return (
+    !reply.finish || ["tool-calls", "unknown"].includes(reply.finish) || !!ArenaResponseRecovery.reason(reply.finish)
+  )
+}
+
 /** Turn activity used by checkout eviction; environment/setup timestamps are intentionally absent. */
 export function latestArenaChatActivity(turns: readonly TurnDocument[], runs: readonly RunDocument[]) {
   const dates = turns.flatMap((turn) => [
@@ -1309,6 +1367,9 @@ export const layer: Layer.Layer<
 
     const revealTelemetry = (turn: TurnDocument, metrics: Awaited<ReturnType<typeof resolvedPlacement>>["metrics"]) =>
       promise(() => telemetry?.reveal?.({ runIDs: Object.values(turn.runIDs), metrics }) ?? Promise.resolve())
+    /** For a battle that ends unrevealed: its generations' usage stays blind and is not held for a reveal. */
+    const releaseTelemetry = (turn: TurnDocument) =>
+      promise(() => telemetry?.release?.({ runIDs: Object.values(turn.runIDs) }) ?? Promise.resolve())
 
     const inDirectory = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
       instances.provide({ directory }, effect)
@@ -1337,6 +1398,16 @@ export const layer: Layer.Layer<
         Effect.provideService(InstanceStore.Service, instances),
         Effect.provideService(Git.Service, git),
       )
+    /** `lastTurnStart` for a chat. A failed read only leaves the history whole. */
+    const contestantPruneBoundary = Effect.fn("Arena.contestantPruneBoundary")(function* (
+      store: Store,
+      chatID: string,
+      transcript: readonly SessionV1.WithParts[],
+    ) {
+      const turns = yield* promise(() => store.turnsForChat(chatID)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const start = turns ? lastTurnStart(turns, transcript) : undefined
+      return start ? MessageID.make(start) : undefined
+    })
     const repositoryMutationLock = (commonGitDir: string) => {
       const existing = repositoryMutationLocks.get(commonGitDir)
       if (existing) return existing
@@ -4129,6 +4200,31 @@ export const layer: Layer.Layer<
       )
     })
 
+    // The system text the run's first prompt carried. A reply sends it again rather than building a
+    // new one: the first may hold the staging note a later build leaves out, and a system that
+    // changes mid-session makes the provider re-read the whole conversation uncached. It is reused
+    // only while a build now gives the same text, with or without that note: preview routes live in
+    // this process, so after a restart its URLs can be dead, and one uncached request costs less.
+    const startedSystem = Effect.fnUntraced(function* (
+      worktree: string,
+      sessionID: SessionID,
+      promptMessageID: string | undefined,
+    ) {
+      if (!promptMessageID) return undefined
+      const messages = yield* inDirectory(worktree, sessions.messages({ sessionID })).pipe(
+        Effect.catchCause(() => Effect.succeed([])),
+      )
+      const started = messages
+        .flatMap((message) =>
+          message.info.role === "user" && message.info.id >= promptMessageID && message.info.system
+            ? [message.info.system]
+            : [],
+        )
+        .at(0)
+      const current = [contestantSystemInstruction(worktree, true), contestantSystemInstruction(worktree)]
+      return started !== undefined && current.includes(started) ? started : undefined
+    })
+
     // The proxy routes a contestant's requests, and the recorder keeps its events, only for a run
     // bound in this process. A battle binds each run as it starts it. After an engine restart a
     // settled run is bound to nothing, so resuming it for a reply or a retry binds it again.
@@ -4179,6 +4275,10 @@ export const layer: Layer.Layer<
       const beforeDispatch = yield* promise(() => store.turn(run.turnID))
       if (beforeDispatch?.state === "stopping" || beforeDispatch?.state === "early_selected") return Exit.void
       if (prompt) yield* allowReading(run.worktree.directory, run.sessionID, prompt.readable)
+      // Read before the boundary moves: a reply resumes the run its first prompt started.
+      const system =
+        (yield* startedSystem(run.worktree.directory, run.sessionID, storedRun?.promptMessageID)) ??
+        contestantSystemInstruction(run.worktree.directory, isToolExecutionGated(run.sessionID))
       if (hostDirectory !== run.worktree.directory) promptHosts.set(run.sessionID, hostDirectory)
       let result = yield* Effect.exit(
         inDirectory(
@@ -4193,7 +4293,7 @@ export const layer: Layer.Layer<
                 },
                 agent,
                 variant: "high",
-                system: contestantSystemInstruction(run.worktree.directory, isToolExecutionGated(run.sessionID)),
+                system,
                 parts: prompt.parts,
               })
             : // A retry adds no message: the loop answers the last user message again, from the
@@ -4500,6 +4600,37 @@ export const layer: Layer.Layer<
       b: { result: Pick<FinalizedResult, "finalCommit">; transcript: string; artifactID: string },
       canonical: string,
     ) {
+      const runs = yield* promise(() => store.runsForTurn(turn._id))
+      const finished = (side: Side) => runs.find((run) => run._id === turn.runIDs[side])?.runState === "complete"
+      // A failed side leaves nothing to weigh the other side against, so only a battle both sides
+      // finished pays for a report. The first turn still asks for the chat's name.
+      if (!finished("a") || !finished("b")) {
+        yield* promise(() => store.updateTurn(turn._id, { comparisonState: "skipped" }))
+        const commits = {
+          canonical,
+          baseCommit: turn.frozenBaseSHA,
+          aCommit: a.result.finalCommit,
+          bCommit: b.result.finalCommit,
+        }
+        const trees = yield* withGit(comparisonTrees(commits)).pipe(Effect.mapError(error))
+        const skipped = yield* promise(() =>
+          skipComparison({
+            turnID: turn._id,
+            turnIndex: turn.turnIndex,
+            userPrompt: turn.userPrompt,
+            userAttachments: ArenaAttachments.describeForJudge(turn.userAttachments),
+            baseCommit: commits.baseCommit,
+            aCommit: commits.aCommit,
+            bCommit: commits.bCommit,
+            baseTree: trees.base,
+            aTree: trees.a,
+            bTree: trees.b,
+            artifactIDs: [a.artifactID, b.artifactID],
+          }),
+        )
+        yield* promise(() => store.saveSkippedComparison(skipped))
+        return
+      }
       yield* promise(() => store.updateTurn(turn._id, { comparisonState: "running" }))
       const evidence = yield* withGit(
         compare({
@@ -4659,8 +4790,9 @@ export const layer: Layer.Layer<
 
     /**
      * Whether the session forked at warm-up is the one this send can prompt. Everything the fork
-     * copied has to be unchanged: the canonical session and its transcript, and the port bank its
-     * paths were localized against, which is process-local and so also requires a trusted pair.
+     * copied has to be unchanged: the canonical session and its transcript, the output it cleared,
+     * which the other side may fork again now, and the port bank its paths were localized against,
+     * which is process-local and so also requires a trusted pair.
      */
     const usableWarmFork = (
       trusted: boolean,
@@ -4668,6 +4800,7 @@ export const layer: Layer.Layer<
       warm: WarmWorktreeRecord,
       directory: string,
       sourceID: string,
+      pruneToolOutputBefore: MessageID | undefined,
       portAliases: PreviewRoute["portAliases"],
     ) => {
       if (!warm.forkedSessionID || !warm.forkMessageMap || !warm.portAliases) return undefined
@@ -4676,6 +4809,7 @@ export const layer: Layer.Layer<
       if (warm.forkSourceSessionID !== sourceID || warm.forkTranscriptHash !== turn.canonicalTranscriptHash) {
         return undefined
       }
+      if (warm.forkPruneToolOutputBefore !== pruneToolOutputBefore) return undefined
       if (PORT_ALIASES.some((alias) => warm.portAliases?.[alias] !== portAliases[alias])) return undefined
       return { forkedSessionID: warm.forkedSessionID, forkMessageMap: warm.forkMessageMap }
     }
@@ -4699,6 +4833,7 @@ export const layer: Layer.Layer<
       const transcript = yield* Effect.exit(sessions.messages({ sessionID: sourceID }))
       if (Exit.isFailure(source) || Exit.isFailure(transcript)) return slots
       const transcriptHash = digest(transcript.value)
+      const pruneToolOutputBefore = yield* contestantPruneBoundary(store, chat._id, transcript.value)
       const agent = source.value.agent ?? "build"
       const branch = current.canonicalCheckout?.branch ?? current.arenaBranch
       const historicalEnvironments = yield* historicalEnvironmentsForChat(store, chat._id)
@@ -4729,6 +4864,7 @@ export const layer: Layer.Layer<
                   destination: slot.directory,
                   roots: { canonical: chat.repository.root, worktree: slot.directory },
                   pathMode: "transcript",
+                  ...(pruneToolOutputBefore ? { pruneToolOutputBefore } : {}),
                   onMessageMapping(mapping) {
                     mapping.forEach((target, from) => messageMapping.set(from, target))
                   },
@@ -4764,6 +4900,7 @@ export const layer: Layer.Layer<
                   forkedSessionID: session.id,
                   forkSourceSessionID: sourceID,
                   forkTranscriptHash: transcriptHash,
+                  ...(pruneToolOutputBefore ? { forkPruneToolOutputBefore: pruneToolOutputBefore } : {}),
                   forkMessageMap: Object.fromEntries(messageMapping),
                   portAliases: preview.portAliases,
                 } satisfies WarmWorktreeRecord
@@ -4788,6 +4925,8 @@ export const layer: Layer.Layer<
       prompt: ArenaAttachments.ContestantPrompt,
       warmForksTrusted: boolean,
       autoAccept: boolean,
+      /** Read with the transcript the turn froze, so both sides clear the same output. */
+      pruneToolOutputBefore: MessageID | undefined,
     ) {
       const chat = yield* promise(() => store.chat(turn.chatID))
       if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
@@ -4913,7 +5052,15 @@ export const layer: Layer.Layer<
         const env = previewEnvironment(info.directory)
         const forkStartedAt = Date.now()
         const warmFork = warm
-          ? usableWarmFork(warmForksTrusted, turn, warm, info.directory, sourceID, preview.portAliases)
+          ? usableWarmFork(
+              warmForksTrusted,
+              turn,
+              warm,
+              info.directory,
+              sourceID,
+              pruneToolOutputBefore,
+              preview.portAliases,
+            )
           : undefined
         if (warm?.forkedSessionID && !warmFork) {
           // Forked from an older transcript or in another process; nothing else refers to it.
@@ -4933,6 +5080,7 @@ export const layer: Layer.Layer<
             destination: info.directory,
             roots: { canonical: chat.repository.root, worktree: info.directory },
             pathMode: "transcript",
+            ...(pruneToolOutputBefore ? { pruneToolOutputBefore } : {}),
             onMessageMapping(mapping) {
               mapping.forEach((target, source) => messageMapping.set(source, target))
             },
@@ -5666,6 +5814,7 @@ export const layer: Layer.Layer<
           new Error("Arena canonical Git state and transcript changed without a reconciled single-agent turn"),
         )
       }
+      const pruneToolOutputBefore = yield* contestantPruneBoundary(store, chat._id, transcript)
       const copyConfiguration = yield* promise(() => arenaCopyConfiguration(base.root)).pipe(
         Effect.onError(() => discardBaseRef),
       )
@@ -5825,7 +5974,14 @@ export const layer: Layer.Layer<
         return yield* respond(store, chat._id)
       }
       const activeTurn = activation.turn
-      yield* executeBattle(store, activeTurn, contestantPrompt.prompt, warmForksTrusted, autoAccept).pipe(
+      yield* executeBattle(
+        store,
+        activeTurn,
+        contestantPrompt.prompt,
+        warmForksTrusted,
+        autoAccept,
+        pruneToolOutputBefore,
+      ).pipe(
         Effect.scoped,
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
@@ -5865,36 +6021,14 @@ export const layer: Layer.Layer<
               failed.state !== "interrupted_recovery"
             )
               return
-            const failureState = failed.state
-            const revealed = yield* promise(() => modelsForDecision(failed, "aborted"))
-            const aborted = yield* promise(() =>
-              store.recordAbort({
-                turnID: activeTurn._id,
-                expectedState: failureState,
-                reason: "Arena battle failed before resolution",
-                models: revealed.models,
-                at: new Date(),
-              }),
+            const aborted = yield* abortUnresolved(
+              store,
+              failed,
+              failed.state,
+              activeChat,
+              "Arena battle failed before resolution",
             )
-            if (!aborted.recorded && aborted.turn.resolution?.kind !== "aborted") return
-            yield* revealTelemetry(failed, revealed.metrics)
-            yield* promise(() => store.transitionTurn(activeTurn._id, "discarding"))
-            yield* cleanup(store, activeTurn, activeChat.repository.root)
-            const canonical = yield* withGit(inspectCanonical(activeChat.repository.root)).pipe(Effect.mapError(error))
-            yield* promise(() => store.transitionTurn(activeTurn._id, "discarded"))
-            yield* promise(() =>
-              store.completeTurn({
-                chatID: activeChat._id,
-                turnID: activeTurn._id,
-                canonicalSHA: canonical.head,
-                canonicalSessionID: activeChat.canonicalSessionID,
-                ...(canonical.branch ? { branch: canonical.branch } : {}),
-                detached: canonical.detached,
-                indexTree: canonical.indexTree,
-                trunkConflicts: canonical.conflicts,
-                completedAt: new Date(),
-              }),
-            )
+            if (!aborted) return
             yield* Effect.logError("Arena battle failed", { turnID: activeTurn._id, cause })
           }),
         ),
@@ -6141,7 +6275,8 @@ export const layer: Layer.Layer<
         (run) => {
           // A working contestant whose request started early is still run by its host's runner.
           return allowReading(run.worktree, SessionID.make(run.rootSessionID), prompt.readable).pipe(
-            Effect.andThen(
+            Effect.andThen(startedSystem(run.worktree, SessionID.make(run.rootSessionID), run.promptMessageID)),
+            Effect.flatMap((system) =>
               inDirectory(
                 promptHosts.get(SessionID.make(run.rootSessionID)) ?? run.worktree,
                 prompts.prompt({
@@ -6152,7 +6287,7 @@ export const layer: Layer.Layer<
                   },
                   agent,
                   variant: "high",
-                  system: contestantSystemInstruction(run.worktree),
+                  system: system ?? contestantSystemInstruction(run.worktree),
                   parts: prompt.parts,
                 }),
               ),
@@ -7971,6 +8106,98 @@ export const layer: Layer.Layer<
       )
     })
 
+    /**
+     * End a battle that failed before anyone decided it: record the abort, settle both sides, remove
+     * their worktrees and give the chat back. False when another caller recorded a different
+     * decision first.
+     *
+     * A battle that failed while it was being created is recorded before the control plane answers,
+     * so an unreachable service cannot leave it stuck, and its pair is never stored or named
+     * (`identitiesRevealed`). The control plane still resolves it in the background, which stops the
+     * assignments routing.
+     */
+    const abortUnresolved = Effect.fn("Arena.abortUnresolved")(function* (
+      store: Store,
+      turn: TurnDocument,
+      expectedState: "creation_failed" | "finalization_failed" | "interrupted_recovery",
+      chat: ChatDocument,
+      reason: string,
+    ) {
+      const reveal = expectedState !== "creation_failed"
+      const resolved = reveal ? yield* promise(() => modelsForDecision(turn, "aborted")) : undefined
+      const aborted = yield* promise(() =>
+        store.recordAbort({
+          turnID: turn._id,
+          expectedState,
+          reason,
+          ...(resolved ? { models: resolved.models } : {}),
+          at: new Date(),
+        }),
+      )
+      if (!aborted.recorded && aborted.turn.resolution?.kind !== "aborted") return false
+      if (resolved && identitiesRevealed(aborted.turn.resolution)) {
+        yield* revealTelemetry(aborted.turn, resolved.metrics)
+        yield* settleAbandonedRuns(store, turn, "interrupted", reason)
+      } else {
+        yield* promise(() => modelsForDecision(turn, "aborted")).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Arena could not resolve a battle that never started", { turnID: turn._id, cause }),
+          ),
+          Effect.forkIn(scope),
+        )
+        yield* releaseTelemetry(turn)
+        yield* settleAbandonedRuns(store, turn, "error", "Arena battle could not start")
+      }
+      yield* promise(() => store.transitionTurn(turn._id, "discarding"))
+      yield* cleanup(store, turn, chat.repository.root)
+      const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
+      yield* promise(() => store.transitionTurn(turn._id, "discarded"))
+      yield* promise(() =>
+        store.completeTurn({
+          chatID: chat._id,
+          turnID: turn._id,
+          canonicalSHA: canonical.head,
+          canonicalSessionID: chat.canonicalSessionID,
+          ...(canonical.branch ? { branch: canonical.branch } : {}),
+          detached: canonical.detached,
+          indexTree: canonical.indexTree,
+          trunkConflicts: canonical.conflicts,
+          completedAt: new Date(),
+        }),
+      )
+      return true
+    })
+
+    /**
+     * Stop and settle the sides an abandoned battle left pending. A side's first prompt can be in
+     * flight before its worktree exists, and a run left `pending` reads as working forever.
+     */
+    const settleAbandonedRuns = Effect.fnUntraced(function* (
+      store: Store,
+      turn: TurnDocument,
+      runState: "error" | "interrupted",
+      message: string,
+    ) {
+      const runs = yield* promise(() => store.runsForTurn(turn._id))
+      yield* Effect.forEach(
+        runs.filter((run) => run.runState === "pending"),
+        (run) =>
+          Effect.gen(function* () {
+            yield* cancelRun(run.worktree, SessionID.make(run.rootSessionID)).pipe(Effect.ignore)
+            yield* promise(() =>
+              store.updateRun(run._id, {
+                runState,
+                durationMs: null,
+                selectable: false,
+                error: message,
+                completedAt: new Date(),
+              }),
+            )
+          }),
+        { concurrency: 2, discard: true },
+      )
+    })
+
     const cleanup = Effect.fn("Arena.cleanup")(function* (store: Store, turn: TurnDocument, _canonical: string) {
       const chat = yield* promise(() => store.chat(turn.chatID))
       if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
@@ -8619,6 +8846,12 @@ export const layer: Layer.Layer<
               return
             }
 
+            // The previous process stopped while ending a battle that never started. Recovery would
+            // park it for Keep or Discard, which names the pair; it ends as it would have.
+            if (turn.state === "creation_failed") {
+              yield* abortUnresolved(store, turn, "creation_failed", currentChat, "Arena battle failed before resolution")
+              return
+            }
             if (
               turn.state === "creating" ||
               turn.state === "worktrees_ready" ||
@@ -8626,7 +8859,6 @@ export const layer: Layer.Layer<
               turn.state === "early_selected" ||
               turn.state === "finalizing" ||
               turn.state === "stopping" ||
-              turn.state === "creation_failed" ||
               turn.state === "finalization_failed" ||
               turn.state === "interrupted_recovery"
             ) {
@@ -8913,10 +9145,12 @@ export const layer: Layer.Layer<
       const canonicalize = <T>(value: T, role?: string, options?: { readonly subagent?: boolean }) =>
         promise(() => canonicalizeTranscriptPaths(retargetSessions(value), paths, role, options))
       const idMap = new Map<string, MessageID>()
+      let last: MessageID | undefined
       for (const message of source) {
         if (message.info.id < boundary) continue
         const id = MessageID.ascending()
         idMap.set(message.info.id, id)
+        last = id
         const parentID =
           message.info.role === "assistant" && message.info.parentID ? idMap.get(message.info.parentID) : undefined
         const cloned = yield* sessions.updateMessage(
@@ -8964,7 +9198,12 @@ export const layer: Layer.Layer<
           }
         }
       }
-      yield* promise(() => store.updateTurn(turn._id, { canonicalGraftedAt: new Date() }))
+      yield* promise(() =>
+        store.updateTurn(turn._id, {
+          canonicalGraftedAt: new Date(),
+          ...(last ? { canonicalLastMessageID: last } : {}),
+        }),
+      )
     })
 
     const transcriptFor = Effect.fn("Arena.transcriptFor")(function* (store: Store, run: RunDocument) {
@@ -10096,18 +10335,20 @@ export const layer: Layer.Layer<
       const chat = yield* promise(() => store.chat(turn.chatID))
       if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
       yield* ensureArchives(store, turn)
+      const reveal = yield* promise(() => anySideShowedOutput(store, turn._id))
       const revealed = yield* promise(() => modelsForDecision(turn, "discard"))
       const recorded = yield* promise(() =>
         store.recordResolution({
           turnID: turn._id,
-          resolution: resolved,
-          models: revealed.models,
+          resolution: reveal ? resolved : stoppedResolution("discard", { revealed: false }),
+          ...(reveal ? { models: revealed.models } : {}),
           expectedState,
           at: new Date(),
         }),
       )
       if (!recorded.recorded) return yield* respond(store, turn.chatID)
-      yield* revealTelemetry(recorded.turn, revealed.metrics)
+      if (reveal) yield* revealTelemetry(recorded.turn, revealed.metrics)
+      else yield* releaseTelemetry(recorded.turn)
       yield* promise(() => store.transitionTurn(turn._id, "discarding"))
       yield* cleanup(store, turn, chat.repository.root)
       const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
@@ -10166,19 +10407,20 @@ export const layer: Layer.Layer<
         } else if (turn.state === "awaiting_vote" || turn.state === "awaiting_stop_resolution") {
           const expectedState: "awaiting_vote" | "awaiting_stop_resolution" = turn.state
           yield* ensureArchives(store, turn)
-          const resolved = stoppedResolution("discard")
+          const reveal = yield* promise(() => anySideShowedOutput(store, turn._id))
           const revealed = yield* promise(() => modelsForDecision(turn, "discard"))
           const recorded = yield* promise(() =>
             store.recordResolution({
               turnID: turn._id,
-              resolution: resolved,
-              models: revealed.models,
+              resolution: stoppedResolution("discard", reveal ? undefined : { revealed: false }),
+              ...(reveal ? { models: revealed.models } : {}),
               expectedState,
               at: new Date(),
             }),
           )
           if (recorded.recorded || recorded.turn.resolution?.kind === "stopped") {
-            yield* revealTelemetry(recorded.turn, revealed.metrics)
+            if (identitiesRevealed(recorded.turn.resolution)) yield* revealTelemetry(recorded.turn, revealed.metrics)
+            else yield* releaseTelemetry(recorded.turn)
             yield* promise(() => store.transitionTurn(turn._id, "discarding"))
             yield* cleanup(store, turn, chat.repository.root)
             const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
@@ -10202,37 +10444,7 @@ export const layer: Layer.Layer<
           turn.state === "finalization_failed" ||
           turn.state === "interrupted_recovery"
         ) {
-          const expectedState: "creation_failed" | "finalization_failed" | "interrupted_recovery" = turn.state
-          const revealed = yield* promise(() => modelsForDecision(turn, "aborted"))
-          const recorded = yield* promise(() =>
-            store.recordAbort({
-              turnID: turn._id,
-              expectedState,
-              reason: "Arena workspace was archived before resolution",
-              models: revealed.models,
-              at: new Date(),
-            }),
-          )
-          if (recorded.recorded || recorded.turn.resolution?.kind === "aborted") {
-            yield* revealTelemetry(recorded.turn, revealed.metrics)
-            yield* promise(() => store.transitionTurn(turn._id, "discarding"))
-            yield* cleanup(store, turn, chat.repository.root)
-            const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
-            yield* promise(() => store.transitionTurn(turn._id, "discarded"))
-            yield* promise(() =>
-              store.completeTurn({
-                chatID: chat._id,
-                turnID: turn._id,
-                canonicalSHA: canonical.head,
-                canonicalSessionID: chat.canonicalSessionID,
-                ...(canonical.branch ? { branch: canonical.branch } : {}),
-                detached: canonical.detached,
-                indexTree: canonical.indexTree,
-                trunkConflicts: canonical.conflicts,
-                completedAt: new Date(),
-              }),
-            )
-          }
+          yield* abortUnresolved(store, turn, turn.state, chat, "Arena workspace was archived before resolution")
         } else if (
           turn.state === "application_failed" ||
           turn.state === "canonicalization_failed" ||

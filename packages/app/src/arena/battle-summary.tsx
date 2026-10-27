@@ -2,7 +2,7 @@ import { arenaSubscription } from "./stream-subscription";
 import { arenaSizeErrorOr } from "./chat-too-large";
 import { ArenaStreamStatus } from "./stream-status";
 import { useArenaStream } from "./use-arena-stream";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import Animated, {
@@ -42,7 +42,13 @@ import {
   MAX_CONTENT_WIDTH,
 } from "@/constants/layout";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
-import { battleWinnerSide, gitApplicationNotice, isStoppedByEarlyPick } from "./battle-result";
+import {
+  battleFailedToStart,
+  battleWinnerSide,
+  gitApplicationNotice,
+  isStoppedByEarlyPick,
+  settledHistoryRun,
+} from "./battle-result";
 import { ArenaPathList } from "./path-list";
 import { useContainerWidth } from "@/hooks/use-container-width";
 import { useArenaDiffLayout } from "./diff-layout";
@@ -57,7 +63,7 @@ import { ArenaModelVendorIcon } from "./model-vendor-icon";
 import { describeSummaryOmissions } from "./summary-omissions";
 import { ArenaRunMeta } from "./run-meta";
 import { ArenaRunThread } from "./run-thread";
-import { arenaSessionQueryKey } from "./use-arena-session";
+import { arenaSessionQueryKey, useArenaStartMutation } from "./use-arena-session";
 import { ArenaTransitionRow } from "./transition-row";
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
@@ -181,6 +187,18 @@ function runsAreFinal(runA: ArenaRun | undefined, runB: ArenaRun | undefined): b
   return Boolean(runA && runB && runA.runState !== "pending" && runB.runState !== "pending");
 }
 
+/** A thread's title: the side, and its model once the battle has named it. */
+function ThreadTitle({ side, model }: { side: "a" | "b"; model: string | undefined }) {
+  if (!model) return <Text style={styles.threadTitle}>Agent {side.toUpperCase()}</Text>;
+  return (
+    <View style={styles.threadTitleGroup}>
+      <Text style={styles.threadTitle}>Agent {side.toUpperCase()} ·</Text>
+      <ArenaModelVendorIcon model={model} size={ICON_SIZE.sm} />
+      <Text style={styles.threadTitle}>{arenaModelDisplayName(model)}</Text>
+    </View>
+  );
+}
+
 /** One side's model, as revealed by the vote: its vendor's mark and its name. */
 function RevealedIdentity({
   side,
@@ -228,12 +246,17 @@ function BattleSummaryHeader({
         <ThemedChevronRight size={17} uniProps={mutedColorMapping} />
       )}
       <View style={styles.headerText}>
-        <View style={styles.identityRow}>
-          <RevealedIdentity side="a" model={item.identities?.a.name} winner={winner === "a"} />
-          <Text style={styles.identities}>·</Text>
-          <RevealedIdentity side="b" model={item.identities?.b.name} winner={winner === "b"} />
-          {showOutcome ? <Text style={styles.identities}>· {chosenLabel(item)}</Text> : null}
-        </View>
+        {item.identities ? (
+          <View style={styles.identityRow}>
+            <RevealedIdentity side="a" model={item.identities.a.name} winner={winner === "a"} />
+            <Text style={styles.identities}>·</Text>
+            <RevealedIdentity side="b" model={item.identities.b.name} winner={winner === "b"} />
+            {showOutcome ? <Text style={styles.identities}>· {chosenLabel(item)}</Text> : null}
+          </View>
+        ) : (
+          // Discarded before either side showed anything, so the battle names nobody.
+          <Text style={styles.identities}>{chosenLabel(item)}</Text>
+        )}
       </View>
       {gitNotice && gitNotice.tone !== "info" ? (
         <Text style={styles.conflictBadge}>{gitNotice.title}</Text>
@@ -340,13 +363,7 @@ function BattleThreads({
       <View style={styles.threadPane}>
         <View style={styles.threadHeader}>
           <View style={styles.threadTitleRow}>
-            <View style={styles.threadTitleGroup}>
-              <Text style={styles.threadTitle}>Agent A ·</Text>
-              <ArenaModelVendorIcon model={item.identities?.a.name} size={ICON_SIZE.sm} />
-              <Text style={styles.threadTitle}>
-                {arenaModelDisplayName(item.identities?.a.name)}
-              </Text>
-            </View>
+            <ThreadTitle side="a" model={item.identities?.a.name} />
             {winner === "a" ? (
               <View accessible accessibilityLabel="Agent A winner">
                 <ThemedCheckSquare size={16} uniProps={successColorMapping} />
@@ -367,13 +384,7 @@ function BattleThreads({
       <View style={styles.threadPane}>
         <View style={styles.threadHeader}>
           <View style={styles.threadTitleRow}>
-            <View style={styles.threadTitleGroup}>
-              <Text style={styles.threadTitle}>Agent B ·</Text>
-              <ArenaModelVendorIcon model={item.identities?.b.name} size={ICON_SIZE.sm} />
-              <Text style={styles.threadTitle}>
-                {arenaModelDisplayName(item.identities?.b.name)}
-              </Text>
-            </View>
+            <ThreadTitle side="b" model={item.identities?.b.name} />
             {winner === "b" ? (
               <View accessible accessibilityLabel="Agent B winner">
                 <ThemedCheckSquare size={16} uniProps={successColorMapping} />
@@ -562,7 +573,7 @@ function ExpandedBattleSummary({
         workspaceId={workspaceId}
         item={snapshot?.turn ?? item}
       />
-      <BattleThreads runA={runA} runB={runB} item={item} />
+      <BattleThreads runA={settledHistoryRun(runA)} runB={settledHistoryRun(runB)} item={item} />
       <ArchivedBattleComparison
         serverId={serverId}
         agentId={agentId}
@@ -580,7 +591,107 @@ function ExpandedBattleSummary({
   );
 }
 
+/**
+ * A battle that failed while it was being created. Neither side ran, so there is nothing to expand
+ * and nobody to name. Try again sends the same prompt as a new battle, which draws a new pair.
+ */
+function FailedBattleStart({
+  serverId,
+  agentId,
+  item,
+  canStartAgain,
+}: {
+  serverId: string;
+  agentId: string;
+  item: ArenaHistoryItem;
+  canStartAgain: boolean;
+}) {
+  const toast = useToast();
+  const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const { mutateAsync: startArena } = useArenaStartMutation(serverId, agentId);
+  // Held from the press, through the prompt lookup, until the start settles: a second press in
+  // between would send the prompt twice.
+  const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
+  const handleStartAgain = useCallback(() => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    const run = async () => {
+      if (!client) throw new Error("Arena daemon connection is unavailable");
+      const turn = (await client.arenaTurn(agentId, item.id)).turn;
+      if (!turn?.prompt) throw new Error("This battle's prompt is no longer available.");
+      // The turn keeps attachment labels, not their bytes, so only the composer can send them again.
+      if (turn.attachments?.length) {
+        throw new Error("This prompt had attachments. Send it again from the composer with them.");
+      }
+      await startArena({ prompt: turn.prompt });
+    };
+    void run()
+      .catch((error) => toast.error(toErrorMessage(error)))
+      .finally(() => {
+        startingRef.current = false;
+        setStarting(false);
+      });
+  }, [agentId, client, item.id, startArena, toast]);
+  return (
+    <View style={[styles.card, styles.failedStart]} testID={`arena-summary-${item.id}`}>
+      <View style={styles.headerText}>
+        <Text style={styles.gitNoticeTitle}>{"Battle couldn't start"}</Text>
+        <Text style={styles.gitNoticeDetail}>
+          Neither agent ran, so both stay hidden. Your project is unchanged.
+        </Text>
+      </View>
+      {canStartAgain ? (
+        <Button
+          size="xs"
+          variant="outline"
+          loading={starting}
+          onPress={handleStartAgain}
+          testID="arena-failed-start-retry"
+        >
+          Try again
+        </Button>
+      ) : null}
+    </View>
+  );
+}
+
 export function ArenaBattleSummary({
+  serverId,
+  workspaceId,
+  agentId,
+  item,
+  canStartAgain = false,
+}: {
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  item: ArenaHistoryItem;
+  /** Whether a battle that failed to start can be sent again now: nothing else is running. */
+  canStartAgain?: boolean;
+}) {
+  if (battleFailedToStart(item)) {
+    return (
+      <FailedBattleStart
+        serverId={serverId}
+        agentId={agentId}
+        item={item}
+        canStartAgain={canStartAgain}
+      />
+    );
+  }
+  return (
+    <DecidedBattleSummary
+      serverId={serverId}
+      workspaceId={workspaceId}
+      agentId={agentId}
+      item={item}
+    />
+  );
+}
+
+function DecidedBattleSummary({
   serverId,
   workspaceId,
   agentId,
@@ -633,6 +744,13 @@ const styles = StyleSheet.create((theme) => ({
     borderRadius: theme.borderRadius.lg,
     backgroundColor: theme.colors.surface1,
     overflow: "hidden",
+  },
+  failedStart: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[3],
+    paddingHorizontal: theme.spacing[3],
+    paddingVertical: theme.spacing[3],
   },
   cardHeader: {
     minHeight: 58,
