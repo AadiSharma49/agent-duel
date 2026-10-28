@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 import type { AccountsConfig } from "./config.js";
 import { AccountsBackend } from "./backend.js";
@@ -31,6 +32,7 @@ export interface AccountsService {
 export interface CreateAccountsServiceOptions {
   readonly config: AccountsConfig;
   readonly logger: Logger;
+  readonly appVersion: string;
   readonly backend?: AccountsBackend;
   readonly shutdownArena?: () => Promise<void>;
 }
@@ -42,7 +44,8 @@ export interface CreateAccountsServiceOptions {
  */
 export function createAccountsService(options: CreateAccountsServiceOptions): AccountsService {
   const backend =
-    options.backend ?? new AccountsBackend(options.config.controlPlaneUrl, options.logger);
+    options.backend ??
+    new AccountsBackend(options.config.controlPlaneUrl, options.logger, options.appVersion);
   const publicKey = resolveSessionPublicKey({
     PASEO_SESSION_PUBLIC_KEY: options.config.sessionPublicKey,
   });
@@ -76,6 +79,10 @@ export function createAccountsService(options: CreateAccountsServiceOptions): Ac
           mode: "hosted",
           token,
           controlPlaneUrl: options.config.controlPlaneUrl,
+          researchAccountID: user.id,
+          researchPartition: createHash("sha256")
+            .update(JSON.stringify([options.config.controlPlaneUrl, user.id]))
+            .digest("hex"),
         });
         await shutdownArena();
       });

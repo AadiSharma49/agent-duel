@@ -54,7 +54,13 @@ import { LOCAL_STATE_DIRNAME, localStatePath, PRIVATE_REF_PREFIXES } from "@/wor
 import { ignoreForFileProviderSync } from "@/util/file-provider-ignore"
 import { isRecord } from "@/util/record"
 import { generate as generateComparison, skip as skipComparison } from "./comparison"
-import { canonicalizeArenaEnvironment, canonicalizeTranscriptPaths, localizeArenaEnvironment } from "./canonical-path"
+import { canonicalizeTranscriptPaths } from "./canonical-path"
+import {
+  arenaTurnEnvironments,
+  localizeArenaPreviewUrls,
+  producingArenaEnvironment,
+  retargetArenaTranscriptPart,
+} from "./port-retarget"
 import { comparisonTimeline, showedOutput } from "./comparison-timeline"
 import { ArenaContestant, contestantPermissions } from "./contestant"
 import { createBattleAssignments, createSingleAssignment, resolveAssignments } from "./assignment-client"
@@ -67,6 +73,7 @@ import {
   canResumeBattle,
   canRetryRun,
   canTie,
+  canVote,
   earlyResolution,
   chatSlug,
   generationName,
@@ -79,7 +86,9 @@ import {
   spareName,
   stoppedResolution,
   turnID as makeTurnID,
+  voteDiscardedReason,
   voteResolution,
+  type BattleState,
   type Resolution,
   type Side,
   type StopResolution,
@@ -199,6 +208,7 @@ import {
   anyListening,
   releaseTakenBank,
   route as previewRoute,
+  sequentialAllocator,
   url as previewUrl,
   type PreviewRoute,
 } from "./preview"
@@ -227,7 +237,7 @@ import type { Store } from "./mongo"
 
 const encoder = new TextEncoder()
 const contestantWorktreeInstruction =
-  "Git is prepared at the frozen base in an isolated worktree on $PASEO_CURRENT_BRANCH. Work in $(pwd). Branch changes in this worktree are part of your result. Do not modify $PASEO_TRUNK_DIR. Use $PASEO_TRUNK_BRANCH only to identify the canonical branch. Port aliases belong only to this contestant environment. Literal ports, preview URLs, log paths, and process IDs in earlier messages or tool output are historical; do not reuse them, connect to them, or stop anything using them. Read the current port aliases and preview URLs from the environment. Run the project the way its developers run it, so the whole project works from the preview URL. For browser-facing services, bind to HOST=127.0.0.1 and use PORT/PASEO_PORT for the primary listener or PASEO_PORT2/PASEO_PORT3 for additional listeners. Start long-running services so they remain alive after the shell tool returns, then verify the assigned port is listening before reporting the matching public URL: ARENA_PREVIEW_URL for PASEO_PORT, ARENA_PREVIEW_URL2 for PASEO_PORT2, or ARENA_PREVIEW_URL3 for PASEO_PORT3."
+  "Git is prepared at the frozen base in an isolated worktree. Work in $(pwd). Branch changes in this worktree are part of your result. Port aliases belong only to this contestant environment. Earlier turns ran in environments that are now closed. Their ports and preview URLs were updated to this environment's values in earlier answers, reasoning, tool calls, and tool output. Earlier file reads, edits, writes, and grep matches, files on disk, long JSON documents, and user messages keep the original ports. Read a file again before you edit it. Any other port or preview URL may belong to another process: connect only to your own ports and preview URLs, and stop only processes you started in this environment. Do not reuse a log path or process ID from an earlier message. Read the current port aliases and preview URLs from the environment. Run the project the way its developers run it, so the whole project works from the preview URL. For browser-facing services, bind to HOST=127.0.0.1 and use PORT/PASEO_PORT for the primary listener or PASEO_PORT2/PASEO_PORT3 for additional listeners. Start long-running services so they remain alive after the shell tool returns, then verify the assigned port is listening before reporting the matching public URL: ARENA_PREVIEW_URL for PASEO_PORT, ARENA_PREVIEW_URL2 for PASEO_PORT2, or ARENA_PREVIEW_URL3 for PASEO_PORT3."
 const canonicalUnavailableReason = "The trunk worktree is unavailable. Restore it at its recorded location, then retry."
 
 // The refusal reaches the user as a toast, so a merge that conflicted in hundreds of files must
@@ -305,7 +315,7 @@ export function contestantSystemInstruction(
     environmentPending && worktree
       ? `The initial model call is running while the environment is still being prepared at ${worktree}. This is your worktree path. You may reason immediately. Tools that do not need the filesystem can run before the base checkout is ready. Once it is ready, safe reads can run while ignored content finishes copying. A tool that could observe or change incomplete state will wait until its required setup phase completes.`
       : ""
-  return [contestantWorktreeInstruction, ArenaResponseRecovery.INSTRUCTION, pendingEnvironment, currentPreview]
+  return [contestantWorktreeInstruction, pendingEnvironment, currentPreview]
     .filter(Boolean)
     .join("\n\n")
 }
@@ -621,17 +631,31 @@ function committedResolution(
   requested: Exclude<Resolution, { readonly kind: "aborted" }>,
   decision: BattleAssignmentDecision,
 ): Exclude<Resolution, { readonly kind: "aborted" }> {
+  // A discard holds whatever this request asked for: the battle ends without applying either side.
+  if (decision === "discard") return stoppedResolution("discard")
   const side = selectedSide(decision)
   if (requested.kind === "vote") {
     if (side) return voteResolution(side)
     if (decision === "tie") return voteResolution("tie")
   }
   if (requested.kind === "early" && side) return earlyResolution(side)
-  if (requested.kind === "stopped") {
-    if (side) return stoppedResolution(side === "a" ? "apply_a" : "apply_b")
-    if (decision === "discard") return stoppedResolution("discard")
-  }
+  if (requested.kind === "stopped" && side) return stoppedResolution(side === "a" ? "apply_a" : "apply_b")
   throw new Error(`Arena battle was already resolved as ${decision}`)
+}
+
+/**
+ * States a committed discard is recorded in. The failed ones are a battle the engine lost after a
+ * Retry claimed it back, which no request could otherwise end.
+ */
+type DiscardableState = "awaiting_vote" | "awaiting_stop_resolution" | "finalization_failed" | "interrupted_recovery"
+
+function isDiscardable(state: BattleState): state is DiscardableState {
+  return (
+    state === "awaiting_vote" ||
+    state === "awaiting_stop_resolution" ||
+    state === "finalization_failed" ||
+    state === "interrupted_recovery"
+  )
 }
 
 /** The frozen starting point a contestant worktree is synced to. */
@@ -1071,6 +1095,25 @@ function steered(transcript: readonly SessionV1.WithParts[], index: number) {
     !reply.finish || ["tool-calls", "unknown"].includes(reply.finish) || !!ArenaResponseRecovery.reason(reply.finish)
   )
 }
+
+/**
+ * Set a run's Auto Accept in its worktree, starting from a value just read from the run. The voter can
+ * toggle it between that read and the set. A toggle writes the run before it sets the worktree, so
+ * reading the run again after each set, until it stops changing, ends on the voter's value.
+ */
+export const settleAutoAccept = Effect.fnUntraced(function* <E1, R1, E2, R2>(
+  initial: boolean,
+  readAgain: Effect.Effect<boolean, E1, R1>,
+  set: (enabled: boolean) => Effect.Effect<void, E2, R2>,
+) {
+  let enabled = initial
+  while (true) {
+    yield* set(enabled)
+    const current = yield* readAgain
+    if (current === enabled) return
+    enabled = current
+  }
+})
 
 /** Turn activity used by checkout eviction; environment/setup timestamps are intentionally absent. */
 export function latestArenaChatActivity(turns: readonly TurnDocument[], runs: readonly RunDocument[]) {
@@ -1958,12 +2001,18 @@ export const layer: Layer.Layer<
         turn.state === "discarding" ||
         turn.state === "discarded" ||
         turn.resolution?.kind === "stopped"
-      if ((!a?.finalCommit || !b?.finalCommit) && !stopped) {
+      // A side working again after a reply keeps its last result's commit until it finishes, so
+      // only a settled side's result counts while the battle runs.
+      const result = (run: RunDocument | undefined) =>
+        run?.finalCommit && run.runState !== "pending" ? run.finalCommit : undefined
+      const partial = turn.state === "running" && Boolean(result(a) || result(b))
+      if (!(result(a) && result(b)) && !stopped && !partial) {
         return yield* Effect.fail(new Error("Arena comparison is not finalized"))
       }
-      // A stopped battle deliberately permits partial and failed contestants. Keep its
-      // diff inspectable by representing a side without a finalized result as the
-      // frozen base revision; the public run still reports that the side has no result.
+      // A stopped battle deliberately permits partial and failed contestants, and a running one
+      // has a result to review as soon as one side finishes. Keep the diff inspectable by
+      // representing a side without a result as the frozen base revision; the public run still
+      // reports that the side has no result.
       return {
         turn,
         a,
@@ -1971,8 +2020,8 @@ export const layer: Layer.Layer<
         input: {
           canonical: chat.repository.root,
           baseCommit: turn.frozenBaseSHA,
-          aCommit: a?.finalCommit ?? turn.frozenBaseSHA,
-          bCommit: b?.finalCommit ?? turn.frozenBaseSHA,
+          aCommit: (stopped ? a?.finalCommit : result(a)) ?? turn.frozenBaseSHA,
+          bCommit: (stopped ? b?.finalCommit : result(b)) ?? turn.frozenBaseSHA,
         },
       }
     })
@@ -1986,12 +2035,12 @@ export const layer: Layer.Layer<
         a: {
           commit: input.aCommit,
           tree: listed.aTree,
-          ...(a?.finalCommit && a.permanentRef ? { ref: a.permanentRef } : {}),
+          ...(input.aCommit === a?.finalCommit && a.permanentRef ? { ref: a.permanentRef } : {}),
         },
         b: {
           commit: input.bCommit,
           tree: listed.bTree,
-          ...(b?.finalCommit && b.permanentRef ? { ref: b.permanentRef } : {}),
+          ...(input.bCommit === b?.finalCommit && b.permanentRef ? { ref: b.permanentRef } : {}),
         },
         treesEqual: listed.aTree === listed.bTree,
         files: listed.files,
@@ -4027,7 +4076,7 @@ export const layer: Layer.Layer<
         SessionRetry.retryable(assistant.error, "arena") !== undefined
       const durationMs =
         runState === "complete" && stored?.startedAt
-          ? Math.max(0, completedAt.getTime() - stored.startedAt.getTime())
+          ? (stored.priorDurationMs ?? 0) + Math.max(0, completedAt.getTime() - stored.startedAt.getTime())
           : null
       yield* promise(() =>
         store.updateRun(run.runID, {
@@ -4263,7 +4312,11 @@ export const layer: Layer.Layer<
       const turn = yield* promise(() => store.turn(run.turnID))
       if (turn?.state === "stopping" || turn?.state === "early_selected") return Exit.void
       const storedRun = yield* promise(() => store.run(run.runID))
-      yield* inDirectory(run.worktree.directory, permissions.setAutoAccept(storedRun?.autoAccept === true))
+      yield* settleAutoAccept(
+        storedRun?.autoAccept === true,
+        promise(() => store.run(run.runID)).pipe(Effect.map((stored) => stored?.autoAccept === true)),
+        (enabled) => inDirectory(run.worktree.directory, permissions.setAutoAccept(enabled)),
+      )
       const startedAt = new Date()
       const promptMessageID = MessageID.ascending()
       yield* promise(() =>
@@ -4335,9 +4388,14 @@ export const layer: Layer.Layer<
       }
       if (Exit.isSuccess(result) && result.value?.info.role === "assistant") {
         const env = previewEnvironment(run.worktree.directory)
-        yield* Effect.forEach(result.value.parts, (part) => sessions.updatePart(localizeArenaEnvironment(part, env)), {
-          discard: true,
-        })
+        yield* Effect.forEach(
+          result.value.parts,
+          (part) => {
+            const localized = localizeArenaPreviewUrls(part, env)
+            return localized === part ? Effect.void : sessions.updatePart(localized)
+          },
+          { discard: true },
+        )
       }
       yield* promise(() => store.updateRun(run.runID, { completedAt: new Date() }))
       ArenaPrivacy.clearDiscardedMessages(run.sessionID)
@@ -4744,19 +4802,16 @@ export const layer: Layer.Layer<
       )
     })
 
-    /** Every past run's port bank and preview URLs, so a copied transcript can be retargeted. */
+    /**
+     * Each resolved turn's winning run with the canonical messages its graft wrote, so a copied
+     * message is retargeted from the port bank and preview URLs of the run that wrote it.
+     */
     const historicalEnvironmentsForChat = Effect.fn("Arena.historicalEnvironmentsForChat")(function* (
       store: Store,
       chatID: string,
     ) {
-      return (yield* promise(() => store.runsForChat(chatID))).map((run) => ({
-        portAliases: run.portAliases,
-        previewUrls: Object.fromEntries(
-          (run.services ?? []).flatMap((service) =>
-            service.proxyRoutes.flatMap((route) => (route.alias && route.url ? [[route.alias, route.url]] : [])),
-          ),
-        ),
-      }))
+      const [turns, runs] = yield* promise(() => Promise.all([store.turnsForChat(chatID), store.runsForChat(chatID)]))
+      return arenaTurnEnvironments(turns, runs)
     })
 
     /** Sessions forked at warm-up that no turn will ever use. */
@@ -4835,7 +4890,6 @@ export const layer: Layer.Layer<
       const transcriptHash = digest(transcript.value)
       const pruneToolOutputBefore = yield* contestantPruneBoundary(store, chat._id, transcript.value)
       const agent = source.value.agent ?? "build"
-      const branch = current.canonicalCheckout?.branch ?? current.arenaBranch
       const historicalEnvironments = yield* historicalEnvironmentsForChat(store, chat._id)
       // Both forks at once: each writes its own session into its own directory.
       return yield* Effect.forEach(
@@ -4850,11 +4904,7 @@ export const layer: Layer.Layer<
                     chatID: chat._id,
                     turnIndex: generation,
                     side: slot.side,
-                    context: {
-                      ...(branch ? { branch } : {}),
-                      trunkDirectory: chat.repository.root,
-                      trunkBranch: current.canonicalCheckout?.branch ?? current.arenaBranch,
-                    },
+                    allocator: sequentialAllocator(store.portCursor()),
                   }),
                 )
                 const env = previewEnvironment(slot.directory)
@@ -4868,13 +4918,14 @@ export const layer: Layer.Layer<
                   onMessageMapping(mapping) {
                     mapping.forEach((target, from) => messageMapping.set(from, target))
                   },
-                  part(part, message) {
-                    if (message.role === "user") return part
-                    const canonicalEnvironment = historicalEnvironments.reduce(
-                      (value, historical) => canonicalizeArenaEnvironment(value, historical),
-                      part,
-                    )
-                    return localizeArenaEnvironment(canonicalEnvironment, env)
+                  part(part, message, sourceMessageID) {
+                    return retargetArenaTranscriptPart(part, {
+                      role: message.role,
+                      producedIn: sourceMessageID
+                        ? producingArenaEnvironment(sourceMessageID, historicalEnvironments)
+                        : undefined,
+                      env,
+                    })
                   },
                 }).pipe(Effect.mapError(error))
                 forked(session.id)
@@ -5041,11 +5092,7 @@ export const layer: Layer.Layer<
             chatID: chat._id,
             turnIndex: turn.turnIndex,
             side,
-            context: {
-              ...(branch ? { branch } : {}),
-              trunkDirectory: chat.repository.root,
-              trunkBranch: chat.canonicalCheckout?.branch ?? chat.arenaBranch,
-            },
+            allocator: sequentialAllocator(store.portCursor()),
           }),
         )
         previewWorktrees.add(info.directory)
@@ -5072,8 +5119,8 @@ export const layer: Layer.Layer<
           forkedID = SessionID.make(warmFork.forkedSessionID)
           forkedAtWarmup = true
         } else {
-          // Keep concrete URLs in the canonical chat for the reader. Contestant copies normalize
-          // every historical run here, then retarget those references to this side's environment.
+          // Keep concrete URLs in the canonical chat for the reader. Contestant copies retarget the
+          // ports each message's own run wrote to this side's environment (`arena/port-retarget.ts`).
           const historicalEnvironments = yield* historicalEnvironmentsForChat(store, chat._id)
           const forked = yield* forkInto({
             sessionID: sourceID,
@@ -5084,13 +5131,14 @@ export const layer: Layer.Layer<
             onMessageMapping(mapping) {
               mapping.forEach((target, source) => messageMapping.set(source, target))
             },
-            part(part, message) {
-              if (message.role === "user") return part
-              const canonicalEnvironment = historicalEnvironments.reduce(
-                (current, historical) => canonicalizeArenaEnvironment(current, historical),
-                part,
-              )
-              return localizeArenaEnvironment(canonicalEnvironment, env)
+            part(part, message, sourceMessageID) {
+              return retargetArenaTranscriptPart(part, {
+                role: message.role,
+                producedIn: sourceMessageID
+                  ? producingArenaEnvironment(sourceMessageID, historicalEnvironments)
+                  : undefined,
+                env,
+              })
             },
           }).pipe(Effect.mapError(error))
           yield* sessions.setAgentModel({
@@ -6489,6 +6537,8 @@ export const layer: Layer.Layer<
       const historicalServices = yield* endRunEnvironment(store, run, at)
       yield* stopPreparation(run.worktree)
       yield* instances.disposeDirectory(run.worktree)
+      // The next pair to adopt the worktree starts from its own run's Auto Accept.
+      yield* permissions.clearAutoAccept(run.worktree)
       markSlotStopped(run.worktree)
       // The run's sessions are gone with the instance, so nothing writes to its temp directory.
       yield* removeContestantTmp(run)
@@ -8039,6 +8089,7 @@ export const layer: Layer.Layer<
           Effect.gen(function* () {
             yield* stopPreparation(loser.worktree)
             yield* instances.disposeDirectory(loser.worktree)
+            yield* permissions.clearAutoAccept(loser.worktree)
             const instanceStoppedAt = Date.now()
             const stopped = yield* stopRunServices(store, loser)
             const failures = stopped.filter((record) => record.status === "failed" || !record.verified)
@@ -8124,7 +8175,15 @@ export const layer: Layer.Layer<
       reason: string,
     ) {
       const reveal = expectedState !== "creation_failed"
-      const resolved = reveal ? yield* promise(() => modelsForDecision(turn, "aborted")) : undefined
+      const resolved = reveal ? yield* promise(() => resolvedPlacement(turn, "aborted")) : undefined
+      // A Retry from another window can bring back a battle whose discard the control plane holds.
+      if (resolved?.decision === "discard") {
+        yield* discardCommitted(store, turn._id, resolved)
+        return true
+      }
+      if (resolved && resolved.decision !== "aborted") {
+        return yield* Effect.fail(new Error(`Arena battle was already resolved as ${resolved.decision}`))
+      }
       const aborted = yield* promise(() =>
         store.recordAbort({
           turnID: turn._id,
@@ -9563,13 +9622,19 @@ export const layer: Layer.Layer<
       if (!retry) {
         const revealed = yield* promise(() => resolvedPlacement(turn, assignmentDecision(resolution)))
         resolution = committedResolution(resolution, revealed.decision)
-        side = resolution.appliedSide ?? side
+        if (!resolution.appliedSide) {
+          yield* discardCommitted(store, turn._id, revealed)
+          return yield* respond(store, turn.chatID)
+        }
+        side = resolution.appliedSide
         vote = resolution.kind === "vote" ? resolution.vote : resolution.kind === "early" ? resolution.vote : undefined
+        const discardedReason = voteDiscardedReason(resolution, yield* promise(() => store.runsForTurn(turn._id)))
         const recorded = yield* promise(() =>
           store.recordResolution({
             turnID: turn._id,
             resolution,
             vote,
+            ...(discardedReason ? { voteDiscardedReason: discardedReason } : {}),
             participantID: participantID(rawParticipantID),
             appliedSide: side,
             models: revealed.models,
@@ -10035,6 +10100,10 @@ export const layer: Layer.Layer<
         if (selected === "tie") return yield* Effect.fail(new Error("Arena ties require both contestant results"))
         const revealed = yield* promise(() => resolvedPlacement(turn, `select:${selected}`))
         const committed = committedResolution(earlyResolution(selected), revealed.decision)
+        if (!committed.appliedSide) {
+          yield* discardCommitted(store, turn._id, revealed)
+          return yield* respond(store, turn.chatID)
+        }
         if (committed.kind !== "early") {
           return yield* Effect.fail(new Error(`Arena battle was already resolved as ${revealed.decision}`))
         }
@@ -10072,8 +10141,13 @@ export const layer: Layer.Layer<
         return yield* promote(store, turn, resolved.appliedSide, resolved, selected, false, votingParticipantID)
       }
       if (turn.state !== "awaiting_vote") return yield* Effect.fail(new Error("Arena turn is not ready for a vote"))
-      if (canResumeBattle(turn, yield* promise(() => store.runsForTurn(turn._id)))) {
+      const runs = yield* promise(() => store.runsForTurn(turn._id))
+      if (canResumeBattle(turn, runs)) {
         return yield* Effect.fail(new Error("Resume or discard this battle before choosing"))
+      }
+      // A failed side has no result to choose, so a battle whose sides both failed is only discarded.
+      if (!canVote(turn, runs, selected)) {
+        return yield* Effect.fail(new Error("Arena can only choose a result that finished"))
       }
       const resolved = voteResolution(selected)
       return yield* promote(store, turn, resolved.appliedSide, resolved, selected, false, votingParticipantID)
@@ -10322,7 +10396,6 @@ export const layer: Layer.Layer<
           ),
         )
       }
-      const expectedState = turn.state === "awaiting_vote" ? "awaiting_vote" : "awaiting_stop_resolution"
       const resolved = stoppedResolution(selected)
       if (resolved.appliedSide) {
         const side = resolved.appliedSide
@@ -10332,23 +10405,84 @@ export const layer: Layer.Layer<
         return yield* promote(store, turn, side, resolved)
       }
 
-      const chat = yield* promise(() => store.chat(turn.chatID))
-      if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
+      // Archived before the control plane commits, so a failure here leaves the battle undecided.
       yield* ensureArchives(store, turn)
-      const reveal = yield* promise(() => anySideShowedOutput(store, turn._id))
       const revealed = yield* promise(() => modelsForDecision(turn, "discard"))
-      const recorded = yield* promise(() =>
+      yield* discardCommitted(store, turn._id, revealed)
+      return yield* respond(store, turn.chatID)
+    })
+
+    /**
+     * Record a battle's discard. A Retry or reply from another window can claim the turn back to
+     * `running` after the reveal; that lost compare-and-set comes back unrecorded, with the turn as
+     * it now stands, instead of failing.
+     */
+    const recordDiscard = (
+      store: Store,
+      turn: TurnDocument,
+      expectedState: DiscardableState,
+      models: Readonly<Record<Side, string>>,
+      reveal: boolean,
+    ) =>
+      promise(() =>
         store.recordResolution({
           turnID: turn._id,
-          resolution: reveal ? resolved : stoppedResolution("discard", { revealed: false }),
-          ...(reveal ? { models: revealed.models } : {}),
+          resolution: stoppedResolution("discard", reveal ? undefined : { revealed: false }),
+          ...(reveal ? { models } : {}),
           expectedState,
           at: new Date(),
         }),
+      ).pipe(
+        Effect.catch((cause) =>
+          promise(() => store.turn(turn._id)).pipe(
+            Effect.flatMap((latest) =>
+              latest && latest.state !== expectedState
+                ? Effect.succeed({ turn: latest, recorded: false as const })
+                : Effect.fail(cause),
+            ),
+          ),
+        ),
       )
-      if (!recorded.recorded) return yield* respond(store, turn.chatID)
-      if (reveal) yield* revealTelemetry(recorded.turn, revealed.metrics)
-      else yield* releaseTelemetry(recorded.turn)
+
+    /**
+     * Cancel a stopping battle's runs that are still working. A Retry's prompt starts only after it
+     * resets its run, which can be after Stop's own cancel, so a caller waiting on the stop repeats this.
+     */
+    const cancelWorkingRuns = Effect.fn("Arena.cancelWorkingRuns")(function* (store: Store, turnID: string) {
+      const runs = yield* promise(() => store.runsForTurn(turnID))
+      yield* Effect.forEach(
+        runs.filter((run) => run.runState === "pending"),
+        (run) => cancelRun(run.worktree, SessionID.make(run.rootSessionID)).pipe(Effect.ignore),
+        { concurrency: 2, discard: true },
+      )
+    })
+
+    /**
+     * Discards this process is recording or finishing, counted by turn. Archive finishes a discard
+     * another request recorded only when none is in flight here, so it never repeats one that is
+     * running and still ends one a crash cut off.
+     */
+    const discardsInFlight = new Map<string, number>()
+    const holdingDiscard = <A, E, R>(turnID: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.suspend(() => {
+        discardsInFlight.set(turnID, (discardsInFlight.get(turnID) ?? 0) + 1)
+        return effect
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const held = (discardsInFlight.get(turnID) ?? 1) - 1
+            if (held > 0) discardsInFlight.set(turnID, held)
+            else discardsInFlight.delete(turnID)
+          }),
+        ),
+      )
+
+    /** Remove a battle whose discard is recorded, leaving the checkout as it was. */
+    const finishDiscard = Effect.fn("Arena.finishDiscard")(function* (
+      store: Store,
+      turn: TurnDocument,
+      chat: ChatDocument,
+    ) {
       yield* promise(() => store.transitionTurn(turn._id, "discarding"))
       yield* cleanup(store, turn, chat.repository.root)
       const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
@@ -10366,7 +10500,54 @@ export const layer: Layer.Layer<
           completedAt: new Date(),
         }),
       )
-      return yield* respond(store, chat._id)
+    })
+
+    /**
+     * Discard a battle the control plane holds as `discard`, whatever this request asked for: that
+     * first decision is final. A Retry or reply from another window can claim the turn back to
+     * `running` between the reveal and the local compare-and-set; its runs are then stopped and the
+     * discard recorded once they settle, so the battle never runs on into a vote nothing can record.
+     */
+    const discardCommitted = (store: Store, turnID: string, revealed: Awaited<ReturnType<typeof resolvedPlacement>>) =>
+      holdingDiscard(turnID, discardCommittedLoop(store, turnID, revealed))
+
+    const discardCommittedLoop = Effect.fn("Arena.discardCommitted")(function* (
+      store: Store,
+      turnID: string,
+      revealed: Awaited<ReturnType<typeof resolvedPlacement>>,
+    ) {
+      const deadline = Date.now() + 30_000
+      while (true) {
+        const turn = yield* promise(() => store.turn(turnID))
+        if (!turn) return yield* Effect.fail(new Error(`Arena turn not found: ${turnID}`))
+        // Another request recorded it first and finishes it.
+        if (turn.resolution) return
+        if (isDiscardable(turn.state)) {
+          const expectedState = turn.state
+          const chat = yield* promise(() => store.chat(turn.chatID))
+          if (!chat) return yield* Effect.fail(new Error(`Arena chat not found: ${turn.chatID}`))
+          // A battle the engine lost while it ran reveals, as `abortUnresolved` does, and may have no
+          // archive to read.
+          const lost = expectedState === "finalization_failed" || expectedState === "interrupted_recovery"
+          if (!lost) yield* ensureArchives(store, turn)
+          const reveal = lost || (yield* promise(() => anySideShowedOutput(store, turn._id)))
+          const recorded = yield* recordDiscard(store, turn, expectedState, revealed.models, reveal)
+          if (recorded.recorded) {
+            if (reveal) yield* revealTelemetry(recorded.turn, revealed.metrics)
+            else yield* releaseTelemetry(recorded.turn)
+            if (lost) yield* settleAbandonedRuns(store, turn, "interrupted", "Arena battle was discarded")
+            return yield* finishDiscard(store, turn, chat)
+          }
+        } else if (turn.state === "running") yield* stop(turn._id).pipe(Effect.ignore)
+        else if (turn.state === "stopping") yield* cancelWorkingRuns(store, turn._id)
+        else if (turn.state !== "finalizing") {
+          return yield* Effect.fail(new Error(`Arena battle cannot be discarded in its current state: ${turn.state}`))
+        }
+        if (Date.now() >= deadline) {
+          return yield* Effect.fail(new Error(`Arena turn did not settle before its discard: ${turn.state}`))
+        }
+        yield* Effect.sleep(Duration.millis(25))
+      }
     })
 
     const archiveSession = Effect.fn("Arena.archiveSession")(function* (sessionID: string) {
@@ -10390,55 +10571,32 @@ export const layer: Layer.Layer<
         if (!turn) return yield* Effect.fail(new Error(`Arena active turn not found: ${chat.activeTurnID}`))
 
         if (turn.state === "running") {
-          yield* promise(() => store.transitionTurn(turn._id, "stopping"))
-          environmentCopyStops.get(turn._id)?.abort(new Error("Arena battle was stopped during environment setup"))
-          const runs = yield* promise(() => store.runsForTurn(turn._id))
-          yield* Effect.forEach(
-            runs,
-            (run) => cancelRun(run.worktree, SessionID.make(run.rootSessionID)).pipe(Effect.ignore),
-            { concurrency: 2, discard: true },
-          )
-          yield* Effect.yieldNow
-          yield* Effect.forEach(
-            runs,
-            (run) => cancelRun(run.worktree, SessionID.make(run.rootSessionID)).pipe(Effect.ignore),
-            { concurrency: 2, discard: true },
-          )
+          yield* stop(turn._id).pipe(Effect.ignore)
+        } else if (turn.state === "stopping") {
+          yield* cancelWorkingRuns(store, turn._id)
         } else if (turn.state === "awaiting_vote" || turn.state === "awaiting_stop_resolution") {
           const expectedState: "awaiting_vote" | "awaiting_stop_resolution" = turn.state
-          yield* ensureArchives(store, turn)
-          const reveal = yield* promise(() => anySideShowedOutput(store, turn._id))
-          const revealed = yield* promise(() => modelsForDecision(turn, "discard"))
-          const recorded = yield* promise(() =>
-            store.recordResolution({
-              turnID: turn._id,
-              resolution: stoppedResolution("discard", reveal ? undefined : { revealed: false }),
-              ...(reveal ? { models: revealed.models } : {}),
-              expectedState,
-              at: new Date(),
+          yield* holdingDiscard(
+            turn._id,
+            Effect.gen(function* () {
+              yield* ensureArchives(store, turn)
+              const reveal = yield* promise(() => anySideShowedOutput(store, turn._id))
+              const revealed = yield* promise(() => modelsForDecision(turn, "discard"))
+              // A turn claimed back to `running` meanwhile is stopped on the next pass, then discarded.
+              const recorded = yield* recordDiscard(store, turn, expectedState, revealed.models, reveal)
+              // A discard another request recorded is its to finish, unless a crash cut that request off.
+              const orphaned =
+                !recorded.recorded &&
+                recorded.turn.resolution?.kind === "stopped" &&
+                recorded.turn.resolution.resolution === "discard" &&
+                (discardsInFlight.get(turn._id) ?? 0) <= 1
+              if (recorded.recorded || orphaned) {
+                if (identitiesRevealed(recorded.turn.resolution)) yield* revealTelemetry(recorded.turn, revealed.metrics)
+                else yield* releaseTelemetry(recorded.turn)
+                yield* finishDiscard(store, turn, chat)
+              }
             }),
           )
-          if (recorded.recorded || recorded.turn.resolution?.kind === "stopped") {
-            if (identitiesRevealed(recorded.turn.resolution)) yield* revealTelemetry(recorded.turn, revealed.metrics)
-            else yield* releaseTelemetry(recorded.turn)
-            yield* promise(() => store.transitionTurn(turn._id, "discarding"))
-            yield* cleanup(store, turn, chat.repository.root)
-            const canonical = yield* withGit(inspectCanonical(chat.repository.root)).pipe(Effect.mapError(error))
-            yield* promise(() => store.transitionTurn(turn._id, "discarded"))
-            yield* promise(() =>
-              store.completeTurn({
-                chatID: chat._id,
-                turnID: turn._id,
-                canonicalSHA: canonical.head,
-                canonicalSessionID: chat.canonicalSessionID,
-                ...(canonical.branch ? { branch: canonical.branch } : {}),
-                detached: canonical.detached,
-                indexTree: canonical.indexTree,
-                trunkConflicts: canonical.conflicts,
-                completedAt: new Date(),
-              }),
-            )
-          }
         } else if (
           turn.state === "creation_failed" ||
           turn.state === "finalization_failed" ||

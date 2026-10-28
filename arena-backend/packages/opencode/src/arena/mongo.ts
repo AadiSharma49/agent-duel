@@ -17,6 +17,7 @@ import {
   type Resolution,
   type Side,
   type Vote,
+  type VoteDiscardedReason,
 } from "./domain"
 import { ArenaActivity } from "./activity"
 import { bound, boundPrepared } from "./artifact"
@@ -39,7 +40,11 @@ import type {
   SingleAgentVote,
   TurnDocument,
   ApplyBaseChoice,
+  PortCursorDocument,
 } from "./records"
+import type { PortCursor } from "./preview"
+
+const PORT_CURSOR_ID = "contestant-ports"
 
 export type ArtifactInput = Omit<
   ArtifactDocument,
@@ -74,6 +79,7 @@ const historyProjection = {
   state: 1,
   resolution: 1,
   vote: 1,
+  voteDiscardedReason: 1,
   selectedEarly: 1,
   appliedSide: 1,
   canonicalUserMessageID: 1,
@@ -185,6 +191,7 @@ export class Store {
   readonly reviewEvents: ArenaCollection<ReviewEventDocument>
   readonly battleMetrics: ArenaCollection<BattleMetricsDocument>
   readonly singleAgentRatings: ArenaCollection<SingleAgentRatingDocument>
+  readonly portCursors: ArenaCollection<PortCursorDocument>
   readonly artifactQueues = new Map<string, Promise<void>>()
 
   constructor(client: ArenaClient, db: ArenaDb | Db) {
@@ -203,6 +210,7 @@ export class Store {
     this.reviewEvents = this.db.collection<ReviewEventDocument>("reviewEvents")
     this.battleMetrics = this.db.collection<BattleMetricsDocument>("battleMetrics")
     this.singleAgentRatings = this.db.collection<SingleAgentRatingDocument>("singleAgentRatings")
+    this.portCursors = this.db.collection<PortCursorDocument>("portCursors")
   }
 
   async initialize() {
@@ -321,6 +329,20 @@ export class Store {
 
   async checkoutEviction(root: string) {
     return this.checkoutEvictions.findOne({ root })
+  }
+
+  /** The cursor `sequentialAllocator` (`preview.ts`) reads, kept across engine restarts. */
+  portCursor(): PortCursor {
+    return {
+      read: async () => (await this.portCursors.findOne({ _id: PORT_CURSOR_ID }))?.next,
+      write: async (next) => {
+        await this.portCursors.replaceOne(
+          { _id: PORT_CURSOR_ID },
+          { _id: PORT_CURSOR_ID, next, updatedAt: new Date() },
+          { upsert: true },
+        )
+      },
+    }
   }
 
   async releaseCheckoutEviction(root: string) {
@@ -826,12 +848,17 @@ export class Store {
       if (manifest?.artifactIDs.length) await this.artifacts.deleteMany({ _id: { $in: [...manifest.artifactIDs] } })
       await this.sessionArchives.deleteOne({ _id: run.transcriptArchiveID, runID })
     }
+    // The request that ended counts toward the run's time whether it completed or failed. The
+    // new request's `startedAt` replaces its own, so this is the last moment it can be measured.
+    const ended =
+      run.startedAt && run.completedAt ? Math.max(0, run.completedAt.getTime() - run.startedAt.getTime()) : 0
     const updated = await this.runs.findOneAndUpdate(
       { _id: runID },
       {
         $set: {
           runState: "pending",
           durationMs: null,
+          priorDurationMs: (run.priorDurationMs ?? 0) + ended,
           selectable: false,
           startedAt: at,
           updatedAt: at,
@@ -1164,11 +1191,13 @@ export class Store {
     readonly turnID: string
     readonly resolution: Resolution
     readonly vote?: Vote
+    readonly voteDiscardedReason?: VoteDiscardedReason
     readonly participantID?: string
     readonly appliedSide?: Side
     /** Left out for a discard that names nobody (`identitiesRevealed`). */
     readonly models?: Readonly<Record<Side, string>>
-    readonly expectedState: "awaiting_vote" | "awaiting_stop_resolution"
+    /** A failed state only for a discard the control plane already holds (`discardCommitted`). */
+    readonly expectedState: "awaiting_vote" | "awaiting_stop_resolution" | "finalization_failed" | "interrupted_recovery"
     readonly at: Date
   }) {
     const candidate = await this.turns.findOne({ _id: input.turnID })
@@ -1180,6 +1209,7 @@ export class Store {
         $set: {
           resolution: input.resolution,
           ...(input.vote ? { vote: input.vote } : {}),
+          ...(input.voteDiscardedReason ? { voteDiscardedReason: input.voteDiscardedReason } : {}),
           ...(input.participantID ? { voteParticipantID: input.participantID } : {}),
           ...(input.resolution.kind === "vote" ? { selectedEarly: false } : {}),
           ...(input.resolution.kind === "vote"
@@ -1224,6 +1254,8 @@ export class Store {
           finalizedSides: input.side,
           ...(input.selectable ? { selectableSides: input.side } : {}),
         },
+        // A side finalizes again after a retry or a resume; the first result is still the first.
+        $min: { firstResultAt: input.at },
         $set: { updatedAt: input.at },
       },
       { returnDocument: "after" },
@@ -1582,6 +1614,7 @@ export class Store {
     const limited = bound({
       data: input.data,
       runStoredBytes: totals,
+      ...(record ? { artifactLimit: input.data.byteLength, runLimit: input.data.byteLength } : {}),
       // A gzip stream or an image cut short does not decode.
       whole: input.compression === "gzip" || input.kind === "image",
     })

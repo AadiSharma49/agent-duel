@@ -1,6 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import type { ArenaComparisonFileDiff, ArenaSide } from "@getpaseo/protocol/arena/rpc-schemas";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { Theme } from "@/styles/theme";
@@ -40,6 +41,12 @@ export function toggleChangesFile(open: readonly string[], file: string): readon
   return open.includes(file) ? open.filter((other) => other !== file) : [...open, file];
 }
 
+interface ShownFileDiff {
+  data: ArenaComparisonFileDiff;
+  /** The side still working when this file was read; its column is a placeholder. */
+  waitingFor: ArenaSide | undefined;
+}
+
 /**
  * One file's diff inside the card, A beside B or as one column. A file both
  * changed the same way reads as the change both made, against the base. A file
@@ -53,6 +60,8 @@ export function InlineFileDiff({
   turnId,
   file,
   layout,
+  waitingFor,
+  revision,
   embedded = false,
 }: {
   serverId: string;
@@ -60,17 +69,30 @@ export function InlineFileDiff({
   turnId: string;
   file: string;
   layout: ArenaDiffLayout;
+  /** The side still working: its column is a placeholder until its result lands. */
+  waitingFor?: ArenaSide;
+  /** The commits of the comparison listing this file; see `useArenaFileDiff`. */
+  revision?: string;
   embedded?: boolean;
 }) {
-  const query = useArenaFileDiff({ serverId, agentId, turnId, file });
+  const query = useArenaFileDiff({ serverId, agentId, turnId, file, revision });
   const { refetch } = query;
   const retry = useCallback(() => void refetch(), [refetch]);
-  if (query.data) {
+  // When the other side lands, the file is read again under a new key and arrives a moment later.
+  // Until it does, the diff keeps the version it was showing, with the placeholder column it was
+  // read with, rather than turning into a spinner.
+  const live: ShownFileDiff | null = query.data ? { data: query.data, waitingFor } : null;
+  const [held, setHeld] = useState<ShownFileDiff | null>(null);
+  if (live && (live.data !== held?.data || live.waitingFor !== held.waitingFor)) setHeld(live);
+  const kept = held?.data.turnID === turnId && held.data.file.file === file ? held : null;
+  const shown = live ?? (query.error ? null : kept);
+  if (shown) {
     return (
       <BaseRelativeFileView
         key={`${turnId}:${file}`}
-        file={query.data.file}
+        file={shown.data.file}
         layout={layout}
+        waitingFor={shown.waitingFor}
         embedded={embedded}
       />
     );

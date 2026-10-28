@@ -21,7 +21,14 @@ import {
   RESOLVING_BATTLE_STATES,
   settledHistoryRun,
 } from "./battle-result";
-import { canRequestBattleDiff, canReviewBattle, hasBattleDiff } from "./comparison-visibility";
+import {
+  arenaDiffQueryKey,
+  battleReviewPhase,
+  battleSummaryStatus,
+  canRequestBattleDiff,
+  canReviewBattle,
+  hasBattleDiff,
+} from "./comparison-visibility";
 import { comparisonDiff, threeWayFile } from "./review-fixtures.test-helpers";
 import {
   arenaSummaryAnchor,
@@ -509,6 +516,148 @@ describe("canReviewBattle", () => {
     expect(
       canReviewBattle(turn({ canVote: false, canDiscardBattle: true, canResumeBattle: true })),
     ).toBe(false);
+  });
+});
+
+describe("arenaDiffQueryKey", () => {
+  type Run = Parameters<typeof arenaDiffQueryKey>[3];
+  const run = (finalCommit?: string) =>
+    ({ runState: "complete", ...(finalCommit ? { finalCommit } : {}) }) as Run;
+  const key = (a: Run, b: Run) => arenaDiffQueryKey("server-1", "agent-1", "turn-1", a, b);
+
+  it("fetches the comparison again when a side's reply lands a new commit", () => {
+    // B reads complete while it still carries its previous result; its new commit lands after.
+    expect(key(run("a1"), run("b2"))).not.toEqual(key(run("a1"), run("b1")));
+  });
+
+  it("keeps one key while the commits stay, so the card and the history share a fetch", () => {
+    expect(key(run("a1"), run("b1"))).toEqual(key(run("a1"), run("b1")));
+    expect(key(run("a1"), run())).not.toEqual(key(run("a1"), run("b1")));
+  });
+});
+
+describe("battleReviewPhase", () => {
+  type Run = Parameters<typeof battleReviewPhase>[1];
+  type Turn = NonNullable<Parameters<typeof battleReviewPhase>[0]>;
+  const turn = (state: Turn["state"]) => ({ state }) as Turn;
+  const run = (runState: NonNullable<Run>["runState"], finalCommit?: string) =>
+    ({ runState, ...(finalCommit ? { finalCommit } : {}) }) as Run;
+
+  it("reviews the first result alone while the other side still works", () => {
+    expect(battleReviewPhase(turn("running"), run("complete", "a1"), run("pending"))).toEqual({
+      kind: "partial",
+      finished: "a",
+      waitingFor: "b",
+    });
+    expect(battleReviewPhase(turn("running"), run("pending"), run("complete", "b1"))).toEqual({
+      kind: "partial",
+      finished: "b",
+      waitingFor: "a",
+    });
+  });
+
+  it("has nothing to review while both work, or when the finished side has no result", () => {
+    expect(battleReviewPhase(turn("running"), run("pending"), run("pending")).kind).toBe("none");
+    expect(battleReviewPhase(turn("running"), run("error"), run("pending")).kind).toBe("none");
+    expect(battleReviewPhase(undefined, run("complete", "a1"), run("pending")).kind).toBe("none");
+  });
+
+  it("drops a side's last result while it works again after a reply", () => {
+    expect(battleReviewPhase(turn("running"), run("pending", "a1"), run("complete", "b1"))).toEqual(
+      {
+        kind: "partial",
+        finished: "b",
+        waitingFor: "a",
+      },
+    );
+  });
+
+  it("stays on the first result while the other side's run is complete but its commit is not", () => {
+    expect(battleReviewPhase(turn("running"), run("complete", "a1"), run("complete"))).toEqual({
+      kind: "partial",
+      finished: "a",
+      waitingFor: "b",
+    });
+    expect(battleReviewPhase(turn("running"), run("complete"), run("complete", "b1"))).toEqual({
+      kind: "partial",
+      finished: "b",
+      waitingFor: "a",
+    });
+  });
+
+  it("reviews both results as soon as both are in, and otherwise once the turn can be diffed", () => {
+    expect(battleReviewPhase(turn("awaiting_vote"), run("complete", "a1"), run("error")).kind).toBe(
+      "full",
+    );
+    expect(
+      battleReviewPhase(turn("running"), run("complete", "a1"), run("complete", "b1")).kind,
+    ).toBe("full");
+    expect(battleReviewPhase(turn("running"), run("complete", "a1"), run("error")).kind).toBe(
+      "none",
+    );
+    expect(battleReviewPhase(turn("stopping"), run("stopped"), run("stopped")).kind).toBe("none");
+    // A battle the engine's restart cut off waits to resume before anything is compared.
+    expect(
+      battleReviewPhase(
+        { state: "awaiting_vote", canResumeBattle: true } as Turn,
+        run("interrupted"),
+        run("complete", "b1"),
+      ).kind,
+    ).toBe("none");
+  });
+});
+
+describe("battleSummaryStatus", () => {
+  const record = (state: "running" | "complete" | "failed", output?: string) => ({
+    state,
+    ...(output ? { output } : {}),
+    truncated: false,
+    omittedArtifacts: [],
+  });
+
+  it("counts a summary as coming before the engine writes its record", () => {
+    expect(battleSummaryStatus(undefined, "pending")).toEqual({
+      available: true,
+      pending: true,
+      failed: false,
+    });
+    expect(battleSummaryStatus(undefined, "running")).toEqual({
+      available: true,
+      pending: true,
+      failed: false,
+    });
+  });
+
+  it("offers a retry for a summary that failed before its record was written", () => {
+    expect(battleSummaryStatus(undefined, "failed")).toEqual({
+      available: true,
+      pending: false,
+      failed: true,
+    });
+  });
+
+  it("follows the record once it exists", () => {
+    expect(battleSummaryStatus(record("running"), "running")).toEqual({
+      available: true,
+      pending: true,
+      failed: false,
+    });
+    expect(battleSummaryStatus(record("complete", "report"), "complete")).toEqual({
+      available: true,
+      pending: false,
+      failed: false,
+    });
+    expect(battleSummaryStatus(record("failed"), "failed")).toEqual({
+      available: true,
+      pending: false,
+      failed: true,
+    });
+  });
+
+  it("has nothing to show for identical results or a stopped battle", () => {
+    expect(battleSummaryStatus(record("complete"), "complete").available).toBe(false);
+    expect(battleSummaryStatus(undefined, "skipped").available).toBe(false);
+    expect(battleSummaryStatus(record("running"), "skipped").available).toBe(false);
   });
 });
 

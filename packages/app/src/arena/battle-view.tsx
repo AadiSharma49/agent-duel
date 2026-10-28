@@ -10,6 +10,7 @@ import {
 import { ArrowDown, Maximize2, Minimize2 } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type {
+  ArenaComparisonDiff,
   ArenaHistoryItem,
   ArenaRun,
   ArenaSide,
@@ -28,13 +29,19 @@ import { arenaSizeErrorOr, isArenaSizeError } from "./chat-too-large";
 import { ArenaRunTaskFooter } from "./task-progress-card";
 import { openArenaWorktreeChanges } from "./explorer-selection";
 import { ARENA_RUN_META_HEIGHT, ArenaRunMeta } from "./run-meta";
+import { ArenaMessageAnchorProvider, ArenaRunTurnsMenu } from "./run-turns";
 import type { ArenaTurnAction } from "./use-arena-session";
 import { useArenaBattleActions } from "./use-battle-actions";
 import { arenaChangesRows } from "./changes-rows";
 import { BattleReview } from "./battle-review";
 import { useArenaReviewTelemetry } from "./review-telemetry";
 import { isStoppedByEarlyPick } from "./battle-result";
-import { canReviewBattle } from "./comparison-visibility";
+import {
+  arenaDiffQueryKey,
+  battleReviewPhase,
+  battleSummaryStatus,
+  type BattleReviewPhase,
+} from "./comparison-visibility";
 import type { ArenaPendingQuestion } from "./question";
 import type { ArenaPendingPermission, ArenaPermissionReply } from "./permission";
 import { Button } from "@/components/ui/button";
@@ -60,6 +67,8 @@ type ArenaPaneView = ArenaSide | "both";
 // characters of readable content at the default interface size.
 const STACKED_PANES_BREAKPOINT = 520;
 
+// Room above a message the turns menu scrolls to, so it does not sit against the pane header.
+const JUMP_TO_MESSAGE_INSET = 12;
 const ThemedMaximize2 = withUnistyles(Maximize2);
 const ThemedMinimize2 = withUnistyles(Minimize2);
 const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
@@ -174,6 +183,13 @@ function BattlePane({
   const userScrollActiveRef = useRef(false);
   const [awayFromLatest, setAwayFromLatest] = useState(false);
   const contentHeightRef = useRef(0);
+  const scrollOffsetRef = useRef(0);
+  const threadAreaRef = useRef<View>(null);
+  const messageAnchorsRef = useRef(new Map<string, View>());
+  const registerMessageAnchor = useCallback((messageId: string, node: View | null) => {
+    if (node) messageAnchorsRef.current.set(messageId, node);
+    else messageAnchorsRef.current.delete(messageId);
+  }, []);
 
   const scrollToLatest = useCallback(() => {
     if (!autoScrollEnabledRef.current) return;
@@ -202,6 +218,7 @@ function BattlePane({
   const handleScroll = useCallback(
     (event: NativeSyntheticEvent<NativeScrollEvent>) => {
       const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+      scrollOffsetRef.current = contentOffset.y;
       const contentChangedBeforeCallback = contentSize.height !== contentHeightRef.current;
       if (
         contentChangedBeforeCallback &&
@@ -228,6 +245,28 @@ function BattlePane({
     setAwayFromLatest(false);
     scrollToLatest();
   }, [scrollToLatest]);
+  // Scrolls the thread so the message sits just below its top, and stops following the latest
+  // output. A null message is the turn's prompt, which shows above both panes rather than in the
+  // thread, so the first turn starts at the top of the thread.
+  const jumpToMessage = useCallback((messageId: string | null) => {
+    const scrollTo = (y: number) => {
+      autoScrollEnabledRef.current = false;
+      setAwayFromLatest(true);
+      threadScrollRef.current?.scrollTo({ y: Math.max(0, y), animated: true });
+    };
+    if (messageId === null) {
+      scrollTo(0);
+      return;
+    }
+    const anchor = messageAnchorsRef.current.get(messageId);
+    const threadArea = threadAreaRef.current;
+    if (!anchor || !threadArea) return;
+    threadArea.measureInWindow((_areaX, areaY) => {
+      anchor.measureInWindow((_x, y) => {
+        scrollTo(scrollOffsetRef.current + y - areaY - JUMP_TO_MESSAGE_INSET);
+      });
+    });
+  }, []);
   const handleQuestionResponse = useCallback(
     (question: ArenaPendingQuestion, response: AgentPermissionResponse) => {
       if (run) onQuestionResponse(run, question, response);
@@ -282,7 +321,12 @@ function BattlePane({
     <View style={paneStyle} testID={`arena-pane-${side}`}>
       <View style={styles.paneHeader}>
         <View style={styles.paneHeading}>
-          <Text style={styles.agentName}>Agent {side.toUpperCase()}</Text>
+          <View style={styles.agentNameRow}>
+            <Text style={styles.agentName}>Agent {side.toUpperCase()}</Text>
+            {dispatched ? (
+              <ArenaRunTurnsMenu run={dispatched} side={side} onJumpToMessage={jumpToMessage} />
+            ) : null}
+          </View>
           {dispatched ? (
             <ArenaRunMeta
               run={dispatched}
@@ -323,7 +367,11 @@ function BattlePane({
       <View style={styles.paneBody} testID={`arena-pane-body-${side}`}>
         {/* The jump button anchors to the thread, not the pane body, so it stays clear of the task
             footer and services strip below the thread. */}
-        <View style={[styles.threadArea, run?.runState === "pending" && styles.runningThreadArea]}>
+        <View
+          ref={threadAreaRef}
+          collapsable={false}
+          style={[styles.threadArea, run?.runState === "pending" && styles.runningThreadArea]}
+        >
           <ScrollView
             ref={threadScrollRef}
             style={styles.threadScroll}
@@ -337,16 +385,18 @@ function BattlePane({
             testID={`arena-thread-${side}`}
           >
             {dispatched ? (
-              <ArenaRunThread
-                run={dispatched}
-                stoppedByEarlyPick={stoppedByEarlyPick}
-                queuedSteers={queuedSteers}
-                retry={retry}
-                respondingQuestionId={respondingQuestionId}
-                respondingPermissionId={respondingPermissionId}
-                onQuestionResponse={handleQuestionResponse}
-                onPermissionResponse={handlePermissionResponse}
-              />
+              <ArenaMessageAnchorProvider value={registerMessageAnchor}>
+                <ArenaRunThread
+                  run={dispatched}
+                  stoppedByEarlyPick={stoppedByEarlyPick}
+                  queuedSteers={queuedSteers}
+                  retry={retry}
+                  respondingQuestionId={respondingQuestionId}
+                  respondingPermissionId={respondingPermissionId}
+                  onQuestionResponse={handleQuestionResponse}
+                  onPermissionResponse={handlePermissionResponse}
+                />
+              </ArenaMessageAnchorProvider>
             ) : null}
           </ScrollView>
           {awayFromLatest ? (
@@ -372,11 +422,22 @@ function BattlePane({
   );
 }
 
-// The same key the side panel and the summary fetch, so no view adds a request.
-function useBattleDiff(serverId: string, agentId: string, turnId: string) {
+// The same key the side panel and the summary fetch, so no view adds a request. The first
+// result alone is keyed apart, so the comparison is fetched again once the other side lands.
+function useBattleDiff(
+  serverId: string,
+  agentId: string,
+  turnId: string,
+  runA: ArenaRun | undefined,
+  runB: ArenaRun | undefined,
+  phase: BattleReviewPhase,
+) {
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   return useFetchQuery({
-    queryKey: ["arena", "diff", serverId, agentId, turnId],
+    queryKey: [
+      ...arenaDiffQueryKey(serverId, agentId, turnId, runA, runB),
+      ...(phase.kind === "partial" ? [`partial:${phase.finished}`] : []),
+    ],
     dataShape: "value",
     staleTimeMs: 0,
     queryFn: async () => {
@@ -394,6 +455,12 @@ function useBattleDiff(serverId: string, agentId: string, turnId: string) {
   });
 }
 
+interface ShownBattleDiff {
+  diff: ArenaComparisonDiff;
+  /** The side still working when this diff was fetched; its column is a placeholder. */
+  waitingFor: ArenaSide | null;
+}
+
 /**
  * The card once both results are in: the review region, fed from the same diff
  * query the summary uses.
@@ -404,6 +471,9 @@ function BattleJudging({
   turnId,
   comparison,
   comparisonState,
+  runA,
+  runB,
+  phase,
   retrying,
   onRetry,
 }: {
@@ -412,31 +482,44 @@ function BattleJudging({
   turnId: string;
   comparison: ArenaSnapshot["comparison"];
   comparisonState: NonNullable<ArenaSnapshot["turn"]>["comparisonState"];
+  runA: ArenaRun | undefined;
+  runB: ArenaRun | undefined;
+  phase: Exclude<BattleReviewPhase, { kind: "none" }>;
   retrying: boolean;
   onRetry: () => void;
 }) {
-  // A stopped battle never gets a judge's verdict; the changes stand alone.
-  // Likewise a turn whose comparison never started has nothing to say yet.
-  const summaryPending = comparison?.state === "pending" || comparison?.state === "running";
-  const summaryFailed = comparison?.state === "failed";
-  const summaryAvailable =
-    comparisonState !== "skipped" &&
-    (summaryPending || summaryFailed || Boolean(comparison?.output));
-  const diffQuery = useBattleDiff(serverId, agentId, turnId);
+  // A turn's comparison is pending from its creation, which while one side still works would
+  // read as a summary on its way; nothing starts until both sides finish.
+  const summary =
+    phase.kind === "partial"
+      ? { available: false, pending: false, failed: false }
+      : battleSummaryStatus(comparison, comparisonState);
+  const diffQuery = useBattleDiff(serverId, agentId, turnId, runA, runB, phase);
   const refetchDiff = diffQuery.refetch;
   const retryDiff = useCallback(() => {
     void refetchDiff();
   }, [refetchDiff]);
-  const diff = diffQuery.data;
+  // When the other side lands, the full comparison is fetched under a new key and arrives a moment
+  // later. Until it does, the review keeps the first result it was showing, with the placeholder
+  // column it was fetched with, rather than collapsing every open diff into a spinner.
+  const phaseWaitingFor = phase.kind === "partial" ? phase.waitingFor : null;
+  const live: ShownBattleDiff | null = diffQuery.data
+    ? { diff: diffQuery.data, waitingFor: phaseWaitingFor }
+    : null;
+  const [held, setHeld] = useState<ShownBattleDiff | null>(null);
+  if (live && (live.diff !== held?.diff || live.waitingFor !== held.waitingFor)) setHeld(live);
+  const shown = live ?? (held?.diff.turnID === turnId ? held : null);
+  const diff = shown?.diff;
   const rows = useMemo(() => arenaChangesRows(diff), [diff]);
   return (
     <BattleReview
       serverId={serverId}
       agentId={agentId}
       turnId={turnId}
-      summaryAvailable={summaryAvailable}
-      summaryPending={summaryPending}
-      summaryFailed={summaryFailed}
+      summaryAvailable={summary.available}
+      summaryPending={summary.pending}
+      summaryFailed={summary.failed}
+      waitingFor={shown ? shown.waitingFor : phaseWaitingFor}
       comparison={comparison}
       retrying={retrying}
       onRetry={onRetry}
@@ -451,6 +534,13 @@ function BattleJudging({
 
 function runsAreFinal(runA: ArenaRun | undefined, runB: ArenaRun | undefined): boolean {
   return Boolean(runA && runB && runA.runState !== "pending" && runB.runState !== "pending");
+}
+
+function runHasSettled(runA: ArenaRun | undefined, runB: ArenaRun | undefined): boolean {
+  return (
+    (runA !== undefined && runA.runState !== "pending") ||
+    (runB !== undefined && runB.runState !== "pending")
+  );
 }
 
 interface RespondingIds {
@@ -653,17 +743,25 @@ export function ArenaBattleView({
       ),
     [promptAttachments, promptImages.length],
   );
-  const bothFinal = runsAreFinal(runA, runB);
-  const reviewAvailable = bothFinal && canReviewBattle(turn);
+  const reviewPhase = battleReviewPhase(turn, runA, runB);
   const [paneView, setPaneView] = useArenaPaneView(turn?.index);
+  const bothFinal = runsAreFinal(runA, runB);
   // Observes the review stores and the window; emits nothing into React state,
-  // so the card renders exactly as it did without it.
+  // so the card renders exactly as it did without it. It starts with the first
+  // result, while the early pick is on offer, and stays on until the vote: the
+  // turn passes through `finalizing` between the two, and a gap there would
+  // split one review into two timelines.
   useArenaReviewTelemetry({
     serverId,
     agentId,
     turnId: turn?.id ?? "",
     focused: false,
-    enabled: reviewAvailable && !turn?.resolution,
+    settled: bothFinal,
+    enabled:
+      runHasSettled(runA, runB) &&
+      turn !== undefined &&
+      arenaSetupStatus(turn) === null &&
+      !turn.resolution,
   });
   const { pendingAction } = actions;
   const respondingA = respondingIdsForRun(pendingAction, runA);
@@ -750,7 +848,7 @@ export function ArenaBattleView({
               <ArenaTransitionRow transition={turn.transition} />
             </View>
           ) : null}
-          {reviewAvailable ? (
+          {reviewPhase.kind !== "none" ? (
             <View style={styles.reviewSection}>
               <BattleJudging
                 serverId={serverId}
@@ -758,6 +856,9 @@ export function ArenaBattleView({
                 turnId={turn.id}
                 comparison={snapshot.comparison}
                 comparisonState={turn.comparisonState}
+                runA={runA}
+                runB={runB}
+                phase={reviewPhase}
                 retrying={pendingAction?.kind === "retry_comparison"}
                 onRetry={actions.retryComparison}
               />
@@ -874,6 +975,11 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     gap: theme.spacing[1],
     flexShrink: 0,
+  },
+  agentNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
   },
   // The contestants are the headline of the card, so their names are the largest type on it.
   agentName: {

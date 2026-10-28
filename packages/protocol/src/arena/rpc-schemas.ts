@@ -317,6 +317,8 @@ export const ArenaHistoryItemSchema = z
     state: ArenaBattleStateSchema,
     resolution: ArenaResolutionSchema.optional(),
     vote: ArenaVoteSchema.optional(),
+    // The chosen side applied, but the vote does not count because a side failed.
+    voteDiscardedReason: z.enum(["contestant_failed"]).optional(),
     selectedEarly: z.boolean().optional(),
     appliedSide: ArenaSideSchema.optional(),
     canonicalUserMessageID: z.string().optional(),
@@ -351,6 +353,8 @@ export const ArenaRunSchema = z
     lastEventAt: z.string().optional(),
     completedAt: z.string().optional(),
     durationMs: z.number().nullable(),
+    // Time worked before the current request; see the engine's `RunDocument`.
+    priorDurationMs: z.number().optional(),
     promptMessageID: z.string().optional(),
     diff: z
       .object({
@@ -752,6 +756,8 @@ export const ArenaRunRetryResponseSchema = z.object({
  */
 export const ArenaReviewEventSchema = z.discriminatedUnion("type", [
   z.object({ ...ArenaReviewEventFields, type: z.literal("battle.opened") }),
+  z.object({ ...ArenaReviewEventFields, type: z.literal("battle.waiting") }),
+  z.object({ ...ArenaReviewEventFields, type: z.literal("battle.settled") }),
   z.object({ ...ArenaReviewEventFields, type: z.literal("window.focus") }),
   z.object({ ...ArenaReviewEventFields, type: z.literal("window.blur") }),
   z.object({ ...ArenaReviewEventFields, type: z.literal("focus.toggled"), on: z.boolean() }),
@@ -791,6 +797,11 @@ export const ArenaReviewEventSchema = z.discriminatedUnion("type", [
     side: ArenaSideSchema,
   }),
   z.object({ ...ArenaReviewEventFields, type: z.literal("vote.hovered"), side: ArenaSideSchema }),
+  z.object({
+    ...ArenaReviewEventFields,
+    type: z.literal("early_pick.hovered"),
+    side: ArenaSideSchema,
+  }),
   z.object({ ...ArenaReviewEventFields, type: z.literal("preview.opened"), side: ArenaSideSchema }),
 ]);
 export type ArenaReviewEvent = z.infer<typeof ArenaReviewEventSchema>;

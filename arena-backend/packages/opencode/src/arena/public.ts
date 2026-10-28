@@ -5,6 +5,7 @@ import {
   canResumeBattle,
   canRetryRun,
   canTie,
+  canVote,
   identitiesRevealed,
   INTERRUPTED_RUN_MESSAGE,
   type Resolution,
@@ -79,6 +80,7 @@ export type PublicRun = {
   readonly lastEventAt?: Date
   readonly completedAt?: Date
   readonly durationMs: number | null
+  readonly priorDurationMs?: number
   readonly promptMessageID?: string
   readonly diff?: RunDocument["diff"]
   readonly finalCommit?: string
@@ -328,13 +330,14 @@ export function project(snapshot: BattleSnapshot) {
               : {}),
             ...(turn.resolution ? { resolution: resolution(turn.resolution) } : {}),
             ...(turn.vote ? { vote: turn.vote } : {}),
+            ...(turn.voteDiscardedReason ? { voteDiscardedReason: turn.voteDiscardedReason } : {}),
             ...(turn.selectedEarly === undefined ? {} : { selectedEarly: turn.selectedEarly }),
             ...(turn.appliedSide ? { appliedSide: turn.appliedSide } : {}),
             ...(turn.canonicalUserMessageID ? { canonicalUserMessageID: turn.canonicalUserMessageID } : {}),
             ...(turn.gitApplication ? { gitApplication: turn.gitApplication } : {}),
             ...(turn.transitionEvent ? { transition: transition(turn.transitionEvent) } : {}),
             ...(revealed ? { identities: { a: identity(turn.placement.a), b: identity(turn.placement.b) } } : {}),
-            canVote: turn.state === "awaiting_vote" && !canResumeBattle(turn, snapshot.runs),
+            canVote: canVote(turn, snapshot.runs, "a") || canVote(turn, snapshot.runs, "b"),
             canTie: canTie(turn, snapshot.runs),
             canDiscardBattle: canDiscardBattle(turn, snapshot.runs),
             canResumeBattle: canResumeBattle(turn, snapshot.runs),
@@ -361,6 +364,7 @@ export function project(snapshot: BattleSnapshot) {
       state: item.state,
       ...(item.resolution ? { resolution: resolution(item.resolution) } : {}),
       ...(item.vote ? { vote: item.vote } : {}),
+      ...(item.voteDiscardedReason ? { voteDiscardedReason: item.voteDiscardedReason } : {}),
       ...(item.selectedEarly === undefined ? {} : { selectedEarly: item.selectedEarly }),
       ...(item.appliedSide ? { appliedSide: item.appliedSide } : {}),
       ...(item.canonicalUserMessageID ? { canonicalUserMessageID: item.canonicalUserMessageID } : {}),
@@ -426,6 +430,7 @@ export function project(snapshot: BattleSnapshot) {
         ...(run.lastEventAt ? { lastEventAt: run.lastEventAt } : {}),
         ...(run.completedAt ? { completedAt: run.completedAt } : {}),
         durationMs: run.durationMs ?? null,
+        ...(run.priorDurationMs ? { priorDurationMs: run.priorDurationMs } : {}),
         ...(run.promptMessageID ? { promptMessageID: run.promptMessageID } : {}),
         ...(run.diff ? { diff: run.diff } : {}),
         ...(run.finalCommit ? { finalCommit: run.finalCommit } : {}),

@@ -13,11 +13,25 @@ export function useArenaFileDiff(input: {
   turnId: string;
   /** Null reads nothing. */
   file: string | null;
+  /**
+   * The commits of the comparison the list shows (`comparisonRevision`). A file is keyed by them,
+   * so an open diff reads the file again whenever the list moves to other results: the other side
+   * landing, or a side finishing a reply.
+   */
+  revision?: string;
 }) {
-  const { serverId, agentId, turnId, file } = input;
+  const { serverId, agentId, turnId, file, revision } = input;
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   return useFetchQuery<ArenaComparisonFileDiff>({
-    queryKey: ["arena", "file-diff", serverId, agentId, turnId, file],
+    queryKey: [
+      "arena",
+      "file-diff",
+      serverId,
+      agentId,
+      turnId,
+      file,
+      ...(revision ? [revision] : []),
+    ],
     dataShape: "value",
     staleTimeMs: 0,
     queryFn: async () => {

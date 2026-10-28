@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { MAX_METADATA_CHANGES_CHARS } from "@agent-duel/arena-service/metadata"
-import { comparisonModel } from "@agent-duel/arena-service/utility-model"
+import { utilityModels } from "@agent-duel/arena-service/utility-model"
 import { hashArenaControlToken, setArenaCredentials } from "@/arena/credentials"
 import { generate } from "@/arena/metadata"
 import { closeStore } from "@/arena/runtime"
@@ -37,6 +37,8 @@ function fakeNetwork(answer: () => Response) {
 function hosted() {
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-session",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: hashArenaControlToken("local-control-token"),
@@ -59,7 +61,7 @@ describe("ArenaMetadata", () => {
       {
         url: "https://openrouter.ai/api/v1/chat/completions",
         authorization: "Bearer sk-or-v1-user-key",
-        body: expect.objectContaining({ model: comparisonModel.id, max_tokens: 1_024 }),
+        body: expect.objectContaining({ model: utilityModels[0].id, max_tokens: 1_024 }),
       },
     ])
   })

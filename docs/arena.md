@@ -34,23 +34,45 @@ The engine reaches the routes through `arena/backend.ts`, which keeps the contro
 both modes, so no caller branches on the mode. The rest of this doc says "control plane" for the
 routes; in a BYOK build read it as the in-process service.
 
-After local writes, a hosted runtime selects small research snapshots and uploads them in the
-background to the authenticated control plane at `PASEO_CONTROL_PLANE_URL`. Upload failures are
-logged and dropped. There is no persistent upload queue, retry, or backfill, so local history and
-recovery continue when the control plane is unavailable. Account sessions are verified
-locally with the embedded public key, and signing out does not delete local data. A BYOK build
-creates no uploader, so nothing it records leaves the machine.
+A hosted runtime journals local mutations in the same SQLite transaction as the local write.
+Research validation and chunk conversion run after commit, so conversion failures preserve the
+canonical record and retain the failed mutation separately. Pending revisions survive restarts and
+account changes. Temporary upload failures retry with jittered exponential backoff capped at one
+minute. HTTP 400, 413 and 422 batches are split to isolate refused records; retain those records and
+any manifests depending on refused chunks separately, allowing other uploads to continue. The
+uploader retries retained records hourly, including when no new local writes arrive. The recovery
+deadline survives restarts; still-invalid records return to quarantine for another hour. New writes
+do not wait for that deadline. The queue is partitioned by the verified account and
+hosted destination; a different account cannot upload its predecessor's pending records. BYOK
+creates no research queue or uploader.
 
-Research uploads include chats, turns, runs, generation metadata, structured events, comparisons,
-single-agent ratings, session archives, and transcript or patch artifacts. Raw events and per-call
-full request, response, tool-output, and other artifacts stay local. A research request is limited
-to 3 MiB and a record to 2 MiB; oversized records are logged and dropped while the local copy stays
-intact. The control plane still owns authentication, the OpenRouter proxy, and research
-ingestion.
+On the first hosted start after this change, backfill the verified account's existing chats, turns,
+runs, intact transcript/image artifacts and archive manifests. The durable backfill worklist resumes
+across restarts; a work item moves into the mutation journal atomically. After three unsuccessful
+reads, park unavailable artifacts until the next hosted start or an explicit recovery pass. Other
+history still progresses, and truncated local artifacts cannot be recovered. Unowned history
+is never assigned to whichever account happens to sign in. Backfill reads the current local record
+and allocates its revision transactionally, so concurrent edits cannot be overwritten by a stale
+copy.
 
-A session holds its images inline: a pasted one and every screenshot a contestant reads. A long
-run's transcript is then mostly images, and over the 10 MB artifact limit it is not kept at all,
-which stops the turn instead of asking for a vote. So the archive keeps each image as its own `image`
+Research includes chats, turns, runs, generation metadata, structured events, comparisons,
+single-agent ratings, session archives, and transcript, patch and image artifacts. Raw events and
+per-call full request, response and tool-output artifacts stay local. Upload requests remain below
+3 MiB and individual records below 2 MiB. Larger documents go as content-addressed `chunks`, followed
+by a checksum manifest in the original collection. Research readers resolve that manifest with
+`resolveResearchDocument` from arena-service, looking up chunks under the same account and source.
+Deploy the control plane's updated arena-service dependency before shipping this desktop protocol;
+an older server refuses chunks, and the desktop retains them for automatic recovery after the server upgrade.
+
+`archiveComplete` means the local archive exists, not that research has uploaded. Reply resets keep
+the previous cloud archive until its replacement arrives. Transcript and image archives are kept
+whole without the per-call artifact size budgets; disk errors fail the local write rather than
+turning an archive into an empty success. The queue has no size-based eviction, so an extended
+outage consumes local disk until uploads succeed. The guarantee covers committed local records;
+it cannot protect against disk exhaustion, disk failure, or manual deletion of local state.
+
+A session holds its images inline: a pasted one and every screenshot a contestant reads. To avoid
+duplicating those bytes across transcripts, the archive keeps each image as its own `image`
 artifact, named by the SHA-256 of its bytes, and the transcript refers to it as
 `arena-image:sha256:<hash>`, with `imageIDs` listing them (`arena/transcript-artifact.ts`). A
 tool result's attachments, the screenshots and PDFs a contestant reads, never go to the window: the
@@ -69,10 +91,8 @@ no window reads them. A run's thread past 8 MiB goes without its oldest messages
 `activityOmitted`, and its pane says so, so voting and replying keep working (`withinBudget` in
 `arena/transcript.ts`). An Arena answer still over half the socket limit is refused with
 `chat_too_large`, or `arena_diff_too_large` for a comparison, rather than dropping the socket
-(`server/arena/payload-limit.ts`). Research gets the same transcript, sent first so a full upload buffer drops images
-rather than the transcript, and each image as an `images` record; both sides share a battle's images,
-so each is uploaded once. The control plane refuses a whole batch that names a collection it does not know, so
-deploy it before a desktop build that sends a new one.
+(`server/arena/payload-limit.ts`). Research gets the same transcript and each image as an `images`
+record through the durable queue described above.
 
 ## Live synchronization
 
@@ -133,14 +153,35 @@ latest output. The battle uses no side panel tab: the card has the chat's width,
 narrow the card to show the same thing.
 
 Review has two tabs: **Difference summary**, the generated comparison, and **Changes**, the file rows with git's
-status for each pair. A row opens its file's diff right under it and closes it again, several can be open
-at once, and the first diverging file opens on arrival. Past eight rows the rest wait behind Show more, so a
+status for each pair. The review appears as soon as one side has a result (`battleReviewPhase` in
+`comparison-visibility.ts`), so the voter can read it before picking early. It opens on the
+summary tab, which says the other side is still working. Changes holds the finished side's files:
+its counts beside `working` for the other side, no verdict on a pair that is not in yet, and in
+each diff the working side's column is a hatched placeholder the size of the finished side's diff
+(one line per region in the one-column layout), so nothing moves when its result lands. Only the
+finished side expands. The engine's diff stands the
+unfinished side in as the frozen base, the shape a stopped battle already uses; a side working
+again after a reply keeps its last result's commit, so its run state decides, not the commit.
+The comparison and each file's read are keyed by the commits they compare (`arenaDiffQueryKey`,
+`comparisonRevision`), and the first result also by its phase, so they are fetched again when the
+other side lands; until they arrive the review keeps showing what it had. Keying by phase alone
+showed a side's old result after it finished a reply: the engine marks the run complete before it
+records the new commit, so the comparison fetched at that moment compares the old one. A run reads `complete`
+a moment before the engine records its commit, so a side counts as finished only once its commit is
+there; going by run state alone dropped the review out for that moment. A row opens its file's diff
+right under it and closes it again, several can be open at once, and the first diverging file opens
+on arrival. A file the card opened on the first result stays open when both are in, even though the
+first diverging file is then a different one. Past eight rows the rest wait behind Show more, so a
 battle that touched hundreds of files does not push the threads off screen; an open row past them still shows.
 The list names every file either side changed, in path order, without contents; each diff reads its own file
 when it opens (`arena.turn.get_file_diff`). Do not cap the list to bound the response: a cap hid every file B
 alone changed whenever A changed 25.
-The chevron at the end of the tab row folds the whole review away, and a tab opens it again. A ready summary opens first. When
-the review opens before the summary is ready, Changes stays open after it arrives. Changes
+The chevron at the end of the tab row folds the whole review away, and a tab opens it again. The review opens on the
+Difference summary, showing its progress while it generates; Changes opens first only when no summary
+is coming, as for a stopped battle or one where a side failed. The review mounts before the engine writes the comparison
+record, so read the turn's `comparisonState` until the record exists (`battleSummaryStatus` in
+`comparison-visibility.ts`); the review keeps the tab it opened on, and reading only the record
+opened every battle on Changes. Changes
 retries a failed read twice before showing a small manual retry. The summary generator retries
 transient network and service failures
 up to three attempts, while permanent failures such as payment or credentials remain actionable.
@@ -270,8 +311,10 @@ choice while the battle runs sits there too. While neither result is selectable,
 button. When one result becomes selectable, put `Choose A early` or `Choose B early` in its side
 and `Stop` in the other side, and name the side still working above the pill
 (`Agent A is still working`). `Tie` is disabled unless both results can be chosen. When neither
-can, both sides failed: `Discard` takes Tie's place, under `Both agents failed · retry or
-discard` while a side can still be retried and `Both agents failed` once neither can.
+can, both sides failed: `Discard` takes Tie's place and `Choose A` and `Choose B` leave the pill,
+under `Both agents failed · retry or discard` while a side can still be retried and `Both agents
+failed` once neither can. When one side failed, the other can still be chosen under `Agent B failed
+· choosing A won't count as a vote`, and the resolved battle's header says `Vote not counted`.
 Choosing early stops the other side, so it confirms first. Discarding a battle also requires
 confirmation. Action failures remain on the battle until another attempt; the normal
 action controls provide the retry so a destructive operation is never retried automatically.
@@ -607,7 +650,68 @@ A branch switch can make a JavaScript diff block both contestants for minutes. S
 patches use native Git with time and output limits; battle review owns its separate comparison.
 
 Every turn receives a fresh port bank. Proxy routes are keyed by turn, side, and service, use
-`.localhost` hostnames, and never retarget an old URL to a later process.
+`.localhost` hostnames, and never retarget an old URL to a later process. The retarget below leaves
+some earlier-round ports in place (user messages, file content, long JSON), so a contestant command
+that names a port of an earlier round, or names an earlier round's preview hostname, is refused by
+the shell with this round's values (`arena/ports.ts`).
+
+The refusal matches any standalone number, not bind flags: a flag list missed
+`python3 -m http.server N`, `php -S host:N` and a port in a variable, so reads such as `curl` and
+`lsof` of an old port are refused too. Only bank ports a server listened on count, as recorded
+when the run's services were stopped. That keeps the list to a few numbers, so a PID that happens to
+equal one is rare, and it leaves out a project's own fixed ports, which every round runs again. A
+port the command does not spell out, in a config file or a script, still gets through.
+
+Banks come from 20000–29999, below every OS ephemeral range, in order from a cursor the store keeps
+(`portCursors`, `sequentialAllocator` in `arena/preview.ts`). A port an earlier turn used is not
+handed out again until the range wraps, so a port in the history never names a later contestant's
+server. The allocator skips ports in use and well-known defaults; a store without a cursor starts at
+a random point.
+
+The canonical chat keeps the winner's literal ports and preview URLs, so the reader sees the URLs
+that worked. A contestant's copy retargets them to its own bank as it forks
+(`retargetArenaTranscriptPart`, `arena/port-retarget.ts`). Answers, reasoning, and every tool's
+input, output and error follow one rule: every number equal to one of the producing run's ports
+changes, unless it is part of a name (glued to a letter or `_`, a dashed name like `req-N-ab12` or
+`web-N.txt`, a version like `1.N.0`, or a path segment). Whole preview URLs and preview hosts change
+too. Tool calls use the same number rule. On production transcripts, a list of port shapes
+(`localhost:N`, `--port N`, ...) missed shapes nobody listed (`lsof -iTCP:"N"`, `printenv
+PASEO_PORT`, a socket tuple, a LAN URL), and skipping the output of any shell command that read a
+file kept real ports whenever a compound command also ran `git diff` or `cat`.
+
+Never changed: user messages; files, attachments, tool metadata, titles and IDs; the file content
+the file tools read or wrote (`read` and `grep` output, `write`, `edit`, `multiedit` and
+`apply_patch` content), so an edit copied from history still matches the file on disk; `data:` URIs,
+base64 runs, hex runs of 12 or more, UUIDs; JSON longer than 2,500 characters (a string or any
+`{"…` span that parses), which is data a program wrote rather than a command's own result; binary
+output; reasoning that carries metadata. Agent Duel saves reasoning without its metadata
+(`arena/privacy.ts`), so a forked copy never carries a signature to break.
+
+File content a shell command prints or writes (`cat f`, `cat > f <<EOF`) changes like any other
+output, while the file on disk keeps its ports. The contestant prompt tells the contestant to read a
+file again before it edits it.
+
+Three rules keep the mapping exact:
+
+- **The run that wrote the message.** Banks are reused across turns, so matching every run's ports
+  maps a reused port to the wrong alias. The graft records the canonical messages a winner wrote
+  (`canonicalUserMessageID` through `canonicalLastMessageID`), and the fork hands each
+  part its source message id. A turn grafted before the end marker existed counts until the next
+  battle; messages outside every range (Battle-off turns, conflict resolution) stay unchanged.
+- **One pass.** Matches are found on the original text and then replaced, so a new port that
+  equals an old port of the same bank is not rewritten again. `$PASEO_PORT` that the agent wrote
+  stays a variable; it already names whichever environment runs it.
+- **The prompt says what changed.** The contestant prompt lists what was updated and what keeps
+  the original ports, and tells the contestant to connect only to its own ports.
+
+The costs: a command and a long JSON it printed, or a file tool call and the content it read, can
+name different ports; shell reads and writes of a file show ports the file on disk does not have; a
+number that equals a port but is not one (a PID, a size, a line number) changes with it; and ports
+a user typed, or a Battle-off turn ran, stay literal, so they can name a port the other side now
+owns.
+
+After a run, `$ARENA_PREVIEW_URL…` in its answer text is expanded so the reader sees the URL. Port
+variables stay as written.
 
 The transcript hash is what lets the engine refuse to start when git and the transcript have drifted
 apart independently — the sign that something edited the checkout behind Arena's back.
@@ -670,6 +774,17 @@ ordinary turn is in flight. Freezes canonical `HEAD` together with the exact sta
 nonignored-untracked state in `refs/battles/<chat>/turn-<n>/base`, then draws a pair. Both agents
 work from that frozen state, so later canonical movement cannot shift the ground under a running
 battle.
+
+An untracked embedded repository, a directory with its own `.git` the checkout does not track, is
+frozen as its files: what that repository tracks or leaves unignored, filtered through the
+checkout's ignore rules, and never its `.git` (`stageEmbeddedRepositories` in `arena/git.ts`). The
+filter is there because a contestant has no `.git` in that directory and reads the files through the
+checkout's rules. `git add -A` cannot be used for them: it records the directory as a gitlink to a
+commit only the embedded repository holds, and fails outright on one with no commit. The vote writes
+the winner's edits back into the embedded repository as uncommitted changes. A winner that replaces
+its directory with a file is refused, since the write would delete the `.git`. A contestant that
+commits those files makes the checkout track them once it wins. A gitlink the checkout tracks,
+submodule or not, still reaches a contestant as an empty directory.
 
 **The draw** (`arena-service/src/pool.ts`). The service draws two distinct profiles uniformly from
 its pool; which one lands on side A is part of the draw. It stores the private mapping permanently
@@ -957,9 +1072,12 @@ vote.
 
 The comparison uses base-to-agent changes, direct A/B differences, and visible timelines. It uses the dedicated
 `POST /api/arena/comparison` route, which accepts only the expected single-message payload for an
-unresolved battle scope and always selects `minimax/minimax-m2.7` via groq in the service
-(`arena/comparison.ts`). There is no generic or unassigned comparison path through the OpenRouter
-proxy.
+unresolved battle scope and picks the model in the service (`arena-service/src/utility-model.ts`):
+Qwen 3.8 27B on Cerebras with low reasoning, and on any failure status or network error, DeepSeek
+V4.1 Flash on Baseten with reasoning off. Baseten ignores `effort: low` and reasons for thousands of
+tokens, so DeepSeek runs without it. The comparison record keeps the first choice in `model` and the
+model that answered in `resolvedModel`. There is no generic or unassigned comparison path through
+the OpenRouter proxy.
 
 The Commit and Create PR buttons get their text from the same model through
 `POST /api/arena/metadata` (`arena-service/src/metadata.ts`), never from an agent, and so do the
@@ -990,7 +1108,13 @@ Use one utility request; increase evidence quality before adding model passes.
 
 ## Resolving
 
-- **Vote** at `awaiting_vote` applies that side (`arena/service.ts:4364`).
+- **Vote** at `awaiting_vote` applies that side, and only a side whose result can be chosen
+  (`canVote` in `arena/domain.ts`), so a failure is never voted for. A vote while the other side
+  failed still applies the chosen side, but it compares a result with a failure, so it does not
+  count: the turn and its battle metrics carry `voteDiscardedReason: "contestant_failed"`, the
+  metrics row has `won` false on both sides, and the research upload carries both
+  (`voteDiscardedReason`). Analysis and the leaderboard drop any battle where a side
+  failed. The control plane's resolve route records only `select:<side>`; it takes no other field.
 - **Early vote** while still `running` claims the resolution, then cancels the loser in the
   background until it reports terminal. Ties are rejected here — a tie needs both results. The
   early choice asks before sending one, since the other side's work is gone the moment it lands.
@@ -1001,7 +1125,8 @@ Use one utility request; increase evidence quality before adding model passes.
   runs failed (`canDiscardBattle`). It is the stopped battle's discard: the control plane records
   `discard`, not a vote, and the checkout is left as it was.
 - **Stop** moves to `awaiting_stop_resolution`, where the choice is discard, keep A, or keep B
-  (`arena/service.ts:4527`).
+  (`arena/service.ts:4527`). Keeping a side when the other had already failed, not just been
+  stopped, carries the same `voteDiscardedReason`, so metrics do not file it as a win.
 
 **Applying** (`arena/service.ts:4039`) records the resolution and enters `applying` in one
 compare-and-set. The response and feed reveal that durable choice before transcript retention,
@@ -1126,6 +1251,13 @@ display names. The local resolution and revealed names are written together, so 
 never contains identities. The server keeps the assignment mapping permanently, so an old unresolved
 battle remains resolvable. Failed run text is masked to "Contestant run failed". The UI never has the
 names to leak, so nothing in `packages/app/` needs to enforce secrecy.
+
+A committed `discard` has no side to honour, so any request that meets it discards the battle
+(`discardCommitted`). A Retry or reply from another window can claim the turn back to `running`
+between the reveal and the local write; the engine stops those runs first, or the battle runs on
+into a vote that can only fail. If the engine loses that battle (`interrupted_recovery`,
+`finalization_failed`), the discard still lands there, revealed as an aborted battle would be,
+because the control plane will not take the abort.
 
 `identity.name` is the profile's **display name** ("Qwen 3.8 Max"), not the slug — the app matches on
 it for vendor marks and pretty names.
@@ -1316,6 +1448,9 @@ or restart a contestant.
 - A tie always applies A, so it is offered only when both results can be chosen.
 - An early vote cancels the loser, so its transcript stops mid-run and its diff is whatever it had
   reached.
+- Review recording starts when the first side settles, not when both have, so an early vote has a
+  review too. Compare early and late votes on `msFromFirstResultToVote`: `timeToVoteMs` counts from
+  `awaiting_vote`, which an early vote never reaches.
 - Generation-scoped battle refs preserve the contestant results. Nothing prunes them.
 - The winner's hydration sends no turn completion, so the chat's stream keeps the end of that
   turn in its live head until the next canonical event; before a new chat's history loads, the

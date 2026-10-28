@@ -1,4 +1,4 @@
-import type { BattleState, Resolution, Side, Vote } from "./domain"
+import type { BattleState, Resolution, Side, Vote, VoteDiscardedReason } from "./domain"
 import type { ArenaActiveOperation, ArenaOperationProgress } from "./operation-tracker"
 import type { RefChange, RefOutcome } from "./ref-types"
 import type { GenerationMetrics, UsageTotals } from "@agent-duel/arena-service/metrics"
@@ -274,6 +274,13 @@ export type CheckoutEvictionDocument = {
   updatedAt: Date
 }
 
+/** Where the next search for contestant ports starts; one document per store. */
+export type PortCursorDocument = {
+  readonly _id: string
+  next: number
+  updatedAt: Date
+}
+
 export type HiddenAssignment = {
   readonly assignmentID: string
   model?: string
@@ -367,11 +374,21 @@ export type TurnDocument = {
   transitionTimestamps: Partial<Record<BattleState, Date>>
   finalizedSides?: Side[]
   selectableSides?: Side[]
+  /**
+   * When the first side finalized, which is when the early pick can first appear. Kept apart
+   * from `transitionTimestamps` because the battle is still `running` then.
+   */
+  firstResultAt?: Date
   comparisonState: "pending" | "running" | "complete" | "skipped" | "failed"
   comparisonID?: Identifier
   failureReason?: string
   resolution?: Resolution
   vote?: Vote
+  /**
+   * Set when the vote was cast while a side had failed: the chosen side still applies, but the vote
+   * does not count (`voteDiscardedReason` in `domain.ts`).
+   */
+  voteDiscardedReason?: VoteDiscardedReason
   voteParticipantID?: string
   selectedEarly?: boolean
   /** Replies sent to the contestants while the battle ran. */
@@ -381,6 +398,7 @@ export type TurnDocument = {
   revealAt?: Date
   applicationAt?: Date
   canonicalizationAt?: Date
+  /** From `awaiting_vote` to the vote. An early vote never reaches `awaiting_vote`, so it has none. */
   timeToVoteMs?: number
   resultingCanonicalSHA?: string
   promotedSessionID?: string
@@ -482,7 +500,17 @@ export type RunDocument = {
   firstToolAt?: Date
   completedAt?: Date
   archivedAt?: Date
+  /**
+   * Time worked across every request of the run: the first, each follow-up to it once it had
+   * finished, and each retry, failed attempts included. The wait before a follow-up is not
+   * counted. Null until the run completes.
+   */
   durationMs: number | null
+  /**
+   * Time worked in the requests before the current one. A follow-up or a retry moves `startedAt`
+   * to its own request, so the time before it is kept here.
+   */
+  priorDurationMs?: number
   runState: "pending" | "complete" | "stopped" | "error" | "interrupted"
   error?: string
   /** The error is a failed model request the engine itself would retry, so the voter may retry it. */
@@ -682,8 +710,9 @@ export type ComparisonDocument = {
   readonly truncated: boolean
   readonly omittedArtifacts: ReadonlyArray<string>
   readonly promptVersion: string
-  readonly model: "minimax/minimax-m2.7"
-  readonly provider: "groq"
+  readonly model: string
+  readonly provider: string
+  resolvedModel?: string
   resolvedProvider?: string
   requestArtifactID?: Identifier
   responseArtifactID?: Identifier
@@ -714,6 +743,10 @@ export type ReviewLayout = (typeof reviewLayouts)[number]
  */
 export type ReviewEvent =
   | { readonly type: "battle.opened" }
+  /** The card opened while one side had finished and the other still worked. */
+  | { readonly type: "battle.waiting" }
+  /** After `battle.waiting`, the other side finished too. Ends the time the early pick was on offer. */
+  | { readonly type: "battle.settled" }
   | { readonly type: "window.focus" }
   | { readonly type: "window.blur" }
   | { readonly type: "focus.toggled"; readonly on: boolean }
@@ -729,6 +762,8 @@ export type ReviewEvent =
   | { readonly type: "contestant.expanded"; readonly side: Side }
   | { readonly type: "activity.expanded"; readonly side: Side }
   | { readonly type: "vote.hovered"; readonly side: Side }
+  /** The pointer reached a side's early pick while the other side was still working. */
+  | { readonly type: "early_pick.hovered"; readonly side: Side }
   /** The voter opened a contestant's running app through the preview proxy. */
   | { readonly type: "preview.opened"; readonly side: Side }
 
@@ -783,10 +818,13 @@ export type ReviewEventInput = {
 export const reviewFlushLimit = 500
 
 /** Bump when a derived field changes meaning, then recompute the whole table. */
-export const battleMetricsSchemaVersion = 6
+export const battleMetricsSchemaVersion = 9
 
 export type ReviewEffort = {
-  /** From the card opening to the first act of reviewing, ignoring window focus events. */
+  /**
+   * From the review opening to the first act of reviewing, ignoring window focus events. A card
+   * that waited for the other side counts from `battle.settled`, so the field keeps its meaning.
+   */
   readonly msToFirstInteraction?: number
   readonly panesOpened: readonly ReviewTab[]
   readonly dwellMsByPane: Readonly<Record<string, number>>
@@ -801,6 +839,11 @@ export type ReviewEffort = {
   readonly verdictExpanded?: boolean
   /** Time with the review open and the window focused, with idle spans dropped. */
   readonly activeMs: number
+  /**
+   * Time with the window focused between `battle.waiting` and `battle.settled`, idle spans
+   * dropped: one side had finished and the early pick was on offer.
+   */
+  readonly waitingActiveMs: number
   /** Every stored event, passive ones included. A completeness check, not a measure of effort. */
   readonly eventCount: number
   /** Only what the voter did: tabs, files, previews, unfolding. */
@@ -812,6 +855,8 @@ export type ReviewEffort = {
    * a voter who did not.
    */
   readonly votesHovered: number
+  /** Sides whose early pick the pointer visited: 0, 1 or both. */
+  readonly earlyPicksHovered: number
   /**
    * How far into a diff the reader got, as a fraction, taking the deepest of
    * whatever files they opened. Absent when nothing was scrolled: a diff shorter
@@ -848,6 +893,7 @@ export type BattleSideMetrics = {
   readonly finishReason?: string
   readonly runState: RunDocument["runState"]
   readonly runErrored: boolean
+  /** Time worked across the run's requests, follow-ups and retries included; see `RunDocument`. */
   readonly durationMs?: number
   /** Offset from the turn's start, so the sequence the voter saw can be rebuilt. */
   readonly completedAtMs?: number
@@ -867,7 +913,10 @@ export type BattleSideMetrics = {
   /** A blinding leak: the contestant named its own vendor in text the voter read. */
   readonly mentionsOwnName?: boolean
   readonly matchedAlias?: string
-  /** False on both sides for a tie, which applies A to git without anyone winning. */
+  /**
+   * False on both sides for a tie, which applies A to git without anyone winning, and for a vote
+   * that does not count (`voteDiscardedReason`).
+   */
   readonly won: boolean
 }
 
@@ -894,12 +943,19 @@ export type BattleMetricsDocument = {
   readonly modelPair: readonly string[]
   /** The vote as cast. `won` is false on both sides for a tie; this is how you find them. */
   readonly vote?: Vote
+  /** The vote does not count, so `won` is false on both sides; drop these from any model ranking. */
+  readonly voteDiscardedReason?: VoteDiscardedReason
   readonly resolutionKind?: string
   readonly selectedEarly: boolean
   /** A steer reaches both contestants, so it belongs to the turn, not a side. */
   readonly steerCount: number
   readonly voteAtMs?: number
   readonly timeToVoteMs?: number
+  /**
+   * From the first side finalizing to `voteAt`, early vote or not, so early and late votes compare
+   * on one clock. Absent on turns from before `firstResultAt` was recorded rather than estimated.
+   */
+  readonly msFromFirstResultToVote?: number
   readonly review?: ReviewEffort
   /** A side with no run is absent rather than invented. */
   readonly sides: Partial<Record<Side, BattleSideMetrics>>
@@ -912,6 +968,7 @@ export type BattleHistoryTurn = Pick<
   | "state"
   | "resolution"
   | "vote"
+  | "voteDiscardedReason"
   | "selectedEarly"
   | "appliedSide"
   | "canonicalUserMessageID"

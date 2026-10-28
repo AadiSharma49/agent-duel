@@ -19,7 +19,11 @@ beforeAll(async () => {
   const app = express();
   app.use(
     "/api/arena-runtime",
-    createArenaRuntimeRouter({ logger: pino({ enabled: false }), fetchImpl: upstream }),
+    createArenaRuntimeRouter({
+      logger: pino({ enabled: false }),
+      appVersion: "0.4.0-beta.14",
+      fetchImpl: upstream,
+    }),
   );
   server = createServer(app);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -54,6 +58,8 @@ describe("Arena runtime proxy", () => {
   it("exchanges a local capability for the account session on an allowed route", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -93,11 +99,16 @@ describe("Arena runtime proxy", () => {
     expect(new Headers(init?.headers).get("x-arena-generation-id")).toBe(
       "gen_00000000000000000000000000000001",
     );
+    expect(new Headers(init?.headers).get("x-agent-duel-version")).toBe("0.4.0-beta.14");
+    expect(new Headers(init?.headers).get("x-agent-duel-os")).toBe(process.platform);
+    expect(new Headers(init?.headers).get("x-agent-duel-arch")).toBe(process.arch);
   });
 
   it("stops the control-plane request when the Arena runtime disconnects mid-stream", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -145,6 +156,8 @@ describe("Arena runtime proxy", () => {
   it("preserves neutral payment errors and Retry-After across the desktop proxy", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -173,6 +186,8 @@ describe("Arena runtime proxy", () => {
   it("tells a contestant the machine is offline only when the network is gone", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -209,6 +224,8 @@ describe("Arena runtime proxy", () => {
   it("forwards commit message and pull request requests to the control plane's metadata route", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -231,6 +248,8 @@ describe("Arena runtime proxy", () => {
   it("forwards a contestant replay and the heartbeat period the engine times out on", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -270,6 +289,8 @@ describe("Arena runtime proxy", () => {
   it("rejects routes outside the Arena allowlist", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -291,6 +312,8 @@ describe("Arena runtime proxy", () => {
   it("does not limit the proxied request body size", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -316,12 +339,16 @@ describe("Arena runtime proxy", () => {
   it("invalidates every local capability when the account session changes", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "old-account-session",
       controlPlaneUrl: "https://control.agentduel.test",
     });
     const runtime = issueRuntimeCapability();
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "new-account-session",
       controlPlaneUrl: "https://control.agentduel.test",
     });
@@ -342,6 +369,8 @@ describe("Arena runtime proxy", () => {
   it("authorizes nothing once Arena runs on the user's own OpenRouter key", async () => {
     installArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "account-session-token",
       controlPlaneUrl: "https://control.agentduel.test",
     });

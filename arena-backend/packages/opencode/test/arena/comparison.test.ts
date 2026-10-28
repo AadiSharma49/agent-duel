@@ -78,6 +78,8 @@ describe("ArenaComparison", () => {
   test("names a first-turn chat with identical trees from the prompt alone", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -150,6 +152,8 @@ describe("ArenaComparison", () => {
   test("records a failed side's turn without a report, and only names a first-turn chat", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -193,6 +197,8 @@ describe("ArenaComparison", () => {
   test("anchors both agents on base and stores raw artifacts", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -240,7 +246,8 @@ describe("ArenaComparison", () => {
         expect(input).toBe("https://control.test/api/arena/comparison")
         request = JSON.parse(String(init?.body)) as Record<string, unknown>
         return Response.json({
-          provider: "Groq",
+          model: "deepseek/deepseek-v4.1-flash-20261017",
+          provider: "BaseTen",
           choices: [{ message: { content: "## Git differences\nConcrete comparison" } }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0.001 },
         })
@@ -269,7 +276,10 @@ describe("ArenaComparison", () => {
     expect(artifacts.map((item) => item.id)).toEqual(["comparison|4:turn|request", "comparison|4:turn|response"])
     expect(result).toMatchObject({
       state: "complete",
-      resolvedProvider: "Groq",
+      model: "qwen/qwen3.8-27b",
+      provider: "cerebras",
+      resolvedModel: "deepseek/deepseek-v4.1-flash-20261017",
+      resolvedProvider: "BaseTen",
       requestArtifactID: "comparison|4:turn|request",
       responseArtifactID: "comparison|4:turn|response",
       artifactIDs: ["patch-a", "patch-b", "patch-ab", "comparison|4:turn|request", "comparison|4:turn|response"],
@@ -279,6 +289,8 @@ describe("ArenaComparison", () => {
   test("names the chat from the first turn's report and keeps the name off the card", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -325,7 +337,7 @@ describe("ArenaComparison", () => {
           choices: [
             {
               message: {
-                content: "## What each agent did\nA darkened it.\n\n**Title:** \"Darker interface theme.\"\n",
+                content: '## What each agent did\nA darkened it.\n\n**Title:** "Darker interface theme."\n',
               },
             },
           ],
@@ -344,6 +356,8 @@ describe("ArenaComparison", () => {
   test("gives a lopsided battle's busy side the budget the quiet side left unused", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -400,6 +414,8 @@ describe("ArenaComparison", () => {
   test("says which agent left the base alone rather than showing an empty section", async () => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -457,6 +473,8 @@ test.each([503, 429, 402])(
   async (status) => {
     setArenaCredentials({
       mode: "hosted",
+      researchPartition: "test-research-partition",
+      researchAccountID: "test-account",
       token: "test-key",
       controlPlaneUrl: "https://control.test",
       controlTokenHash: "0".repeat(64),
@@ -513,6 +531,8 @@ test.each([503, 429, 402])(
 test("caps automatic comparison retries at three attempts", async () => {
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-key",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: "0".repeat(64),
@@ -557,6 +577,8 @@ test("caps automatic comparison retries at three attempts", async () => {
 test("large file evidence makes exactly one model call and records partial coverage", async () => {
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-key",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: "0".repeat(64),
@@ -610,6 +632,8 @@ test("large file evidence makes exactly one model call and records partial cover
 test("complete computed JSON evidence makes one call without a missing-evidence notice", async () => {
   setArenaCredentials({
     mode: "hosted",
+    researchPartition: "test-research-partition",
+    researchAccountID: "test-account",
     token: "test-key",
     controlPlaneUrl: "https://control.test",
     controlTokenHash: "0".repeat(64),
